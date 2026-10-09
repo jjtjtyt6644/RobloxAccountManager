@@ -1,4 +1,5 @@
 pub mod crash_detect;
+pub mod detect;
 pub mod process;
 pub mod reconnect;
 pub mod winscan;
@@ -33,4 +34,6 @@ pub struct Tracked {
     /// Last measured working set, bytes (watcher tick / memory saver).
     pub mem_ws: u64,
     pub mem_note: crate::runtime::trim::MemNote,
+    /// The account's preset CPU priority tier, restored when its window comes to the foreground.
+    pub base_priority: i32,
 }

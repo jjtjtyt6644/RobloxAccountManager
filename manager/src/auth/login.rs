@@ -41,7 +41,21 @@ pub enum LoginErr {
     Failed(String),
 }
 
+/// ram-login.exe built into this exe (see build.rs). Empty when the build didn't include it.
+static EMBEDDED_HELPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ram-login.bin"));
+
+/// The built-in helper is unpacked to %APPDATA%\RobloxAccountManager\bin\ram-login.exe (rewritten
+/// whenever it differs, so an updated manager always runs its matching helper). Without a built-in
+/// copy, a ram-login.exe next to the manager is used.
 pub fn helper_path() -> Option<PathBuf> {
+    if !EMBEDDED_HELPER.is_empty() {
+        let dir = crate::storage::db::Db::dir().join("bin");
+        let path = dir.join(HELPER_EXE);
+        let current = std::fs::read(&path).map_or(false, |b| b == EMBEDDED_HELPER);
+        if current || (std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&path, EMBEDDED_HELPER).is_ok()) {
+            return Some(path);
+        }
+    }
     std::env::current_exe().ok().map(|p| p.with_file_name(HELPER_EXE))
 }
 

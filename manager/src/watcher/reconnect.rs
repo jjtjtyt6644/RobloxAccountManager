@@ -2,7 +2,7 @@ use super::crash_detect;
 use super::State;
 use crate::launcher::Engine;
 use std::time::Duration;
-use sysinfo::{ProcessesToUpdate, System};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 impl Engine {
     /// Retry state machine: attempts++ -> over max => crashed, else wait delay and re-run full launch.
@@ -92,7 +92,7 @@ impl Engine {
             t.values().filter_map(|t| t.pid).map(sysinfo::Pid::from_u32).collect()
         };
         let mut s = System::new();
-        s.refresh_processes(ProcessesToUpdate::Some(&pids), true);
+        s.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true, ProcessRefreshKind::new());
         for p in pids {
             if let Some(pr) = s.process(p) {
                 pr.kill();

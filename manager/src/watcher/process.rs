@@ -5,7 +5,7 @@ use crossbeam_channel::Receiver;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// One watcher thread for all clients. Blocks on a channel when nothing is tracked (0% CPU),
 /// 1 s tick otherwise. Per-client work is small (one process refresh + one window scan for all
@@ -46,7 +46,7 @@ impl Engine {
             return;
         }
         let pids: Vec<Pid> = snap.iter().map(|x| Pid::from_u32(x.1)).collect();
-        sys.refresh_processes(ProcessesToUpdate::Some(&pids), true);
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true, ProcessRefreshKind::new().with_memory());
         let tracked: Vec<u32> = snap.iter().map(|x| x.1).collect();
         let wins = winscan::scan(&tracked);
         let mut fails: Vec<(i64, u32, String, bool)> = vec![];
@@ -141,7 +141,7 @@ impl Engine {
         let recent_other = matches!(last, Some((other, at)) if other != id && at.elapsed() < Duration::from_secs(15));
         if recent_other {
             "client closed right after another account's client started — Roblox's one-window limit \
-             (Settings → Run several accounts at once)"
+             (Settings > Run several accounts at once)"
                 .into()
         } else {
             "client process exited".into()

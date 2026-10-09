@@ -1,6 +1,6 @@
 //! Accounts screen: searchable list with one-click Play/Stop and bulk actions on the left, the
 //! selected account's settings as cards on the right. First-run shows a guided empty state.
-use super::settings_view::{preset_editor, preset_summary};
+use super::settings_view::{preset_summary, profile_fields};
 use super::theme::*;
 use super::widgets::*;
 use crate::app::{App, GroupFilter, Nav};
@@ -39,7 +39,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     egui::SidePanel::left("account-list")
         .resizable(true)
         .default_width(350.0)
-        .width_range(290.0..=540.0)
+        .width_range(250.0..=540.0)
         .frame(egui::Frame::none().fill(PANEL).inner_margin(Margin::same(14.0)))
         .show(ctx, |ui| list(app, ui));
     egui::CentralPanel::default().frame(super::page_frame()).show(ctx, |ui| detail(app, ui));
@@ -147,6 +147,7 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
             ui.add_space(8.0);
             help(ui, "No accounts match this search.");
         }
+        ui.spacing_mut().item_spacing.y = 4.0;
         for a in &shown {
             row(app, ui, a);
         }
@@ -158,60 +159,88 @@ fn row(app: &mut App, ui: &mut egui::Ui, a: &Account) {
     let running = is_running(&a.status);
     let selected = app.selected == Some(a.id);
     let ram = app.engine.tr().get(&a.id).filter(|t| t.pid.is_some() && t.mem_ws > 0).map(|t| (t.mem_ws, t.mem_note));
-    ui.horizontal(|ui| {
-        let mut c = app.checked.contains(&a.id);
-        if ui.checkbox(&mut c, "").on_hover_text("Select for bulk Launch / Stop").changed() {
-            if c {
-                app.checked.insert(a.id);
-            } else {
-                app.checked.remove(&a.id);
+    let why = if a.place_id.is_empty() {
+        Some("Set a game for this account first")
+    } else if a.status == "needs_relogin" {
+        Some("Sign in again first (+ Add account)")
+    } else {
+        None
+    };
+
+    // The whole row is one clickable card (click = select, double-click = Play). Widgets placed on top
+    // of it (checkbox, button) take their own clicks.
+    let (rect, bg) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 56.0), egui::Sense::click());
+    let (fill, stroke) = if selected {
+        (egui::Color32::from_rgb(27, 34, 48), egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.55)))
+    } else if bg.hovered() {
+        (CARD, egui::Stroke::new(1.0, BORDER))
+    } else {
+        (egui::Color32::TRANSPARENT, egui::Stroke::NONE)
+    };
+    ui.painter().rect(rect, egui::Rounding::same(10.0), fill, stroke);
+    if bg.clicked() {
+        app.selected = Some(a.id);
+    }
+    if bg.double_clicked() && !running && why.is_none() {
+        app.engine.launch(a.id);
+    }
+
+    let mut ui = ui.new_child(
+        egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(10.0, 0.0))).layout(Layout::left_to_right(Align::Center)),
+    );
+    ui.spacing_mut().item_spacing.x = 8.0;
+    let mut c = app.checked.contains(&a.id);
+    if ui.checkbox(&mut c, "").on_hover_text("Select for bulk Launch / Stop").changed() {
+        if c {
+            app.checked.insert(a.id);
+        } else {
+            app.checked.remove(&a.id);
+        }
+    }
+    dot(&mut ui, color);
+    // Right-to-left: the button is placed first so it always fits; the memory chip only when there's
+    // room; the name gets whatever is left and is cut with "…".
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        let narrow = ui.available_width() < 220.0;
+        let size = egui::vec2(if narrow { 36.0 } else { 72.0 }, 32.0);
+        if running {
+            if ui.add(subtle(if narrow { "⏹" } else { "⏹ Stop" }).min_size(size)).on_hover_text("Stop").clicked() {
+                app.engine.kill(a.id);
             }
+        } else if ui
+            .add_enabled(why.is_none(), primary(if narrow { "▶" } else { "▶ Play" }).min_size(size))
+            .on_hover_text("Play (or double-click the row)")
+            .on_disabled_hover_text(why.unwrap_or(""))
+            .clicked()
+        {
+            app.engine.launch(a.id);
         }
-        dot(ui, color);
-        let btn_w = 74.0;
-        let chip_w = if ram.is_some() { 72.0 } else { 0.0 };
-        let w = (ui.available_width() - btn_w - chip_w - 8.0).max(110.0);
-        let mut job = LayoutJob::default();
-        job.append(&a.label, 0.0, TextFormat { font_id: FontId::proportional(14.5), color: TEXT, ..Default::default() });
-        let mut sub = format!("\n@{}", a.username);
-        if !a.group_tag.is_empty() {
-            sub.push_str(&format!("  ·  {}", a.group_tag));
-        }
-        job.append(&sub, 0.0, TextFormat { font_id: FontId::proportional(12.0), color: WEAK, ..Default::default() });
-        job.append(&format!("  ·  {text}"), 0.0, TextFormat { font_id: FontId::proportional(12.0), color, ..Default::default() });
-        let r = ui
-            .allocate_ui_with_layout(egui::vec2(w, 46.0), Layout::left_to_right(Align::Center).with_main_justify(true), |ui| {
-                ui.add(egui::SelectableLabel::new(selected, job))
-            })
-            .inner;
-        if r.clicked() {
-            app.selected = Some(a.id);
-        }
-        if let Some((ws, note)) = ram {
+        if let Some((ws, note)) = ram.filter(|_| ui.available_width() > 180.0) {
             let c = if note == MemNote::Focused || ws > 400 * 1024 * 1024 { WEAK } else { GREEN };
             let tip = if note.text().is_empty() { "Memory in use".to_string() } else { format!("Memory in use · {}", note.text()) };
             chip(ui, &format!("{:.0} MB", ws as f64 / 1048576.0), c).on_hover_text(tip);
         }
-        if running {
-            if ui.add(subtle("⏹ Stop").min_size(egui::vec2(btn_w, 30.0))).clicked() {
-                app.engine.kill(a.id);
-            }
-        } else {
-            let why = if a.place_id.is_empty() {
-                Some("Set a game for this account first")
-            } else if a.status == "needs_relogin" {
-                Some("Sign in again first (+ Add account)")
-            } else {
-                None
+        let w = ui.available_width().max(30.0);
+        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+            ui.set_width(w);
+            ui.add_space(9.0);
+            ui.spacing_mut().item_spacing.y = 2.0;
+            let one_line = |t: String, size: f32, c: egui::Color32| {
+                let mut job = LayoutJob::single_section(t, TextFormat { font_id: FontId::proportional(size), color: c, ..Default::default() });
+                job.wrap = egui::text::TextWrapping::truncate_at_width(w);
+                egui::Label::new(job).selectable(false)
             };
-            if ui
-                .add_enabled(why.is_none(), primary("▶ Play").min_size(egui::vec2(btn_w, 30.0)))
-                .on_disabled_hover_text(why.unwrap_or(""))
-                .clicked()
-            {
-                app.engine.launch(a.id);
+            ui.add(one_line(a.label.clone(), 14.5, if selected { egui::Color32::WHITE } else { TEXT }));
+            let mut job = LayoutJob::default();
+            job.wrap = egui::text::TextWrapping::truncate_at_width(w);
+            let mut sub = format!("@{}", a.username);
+            if !a.group_tag.is_empty() {
+                sub.push_str(&format!("  ·  {}", a.group_tag));
             }
-        }
+            job.append(&sub, 0.0, TextFormat { font_id: FontId::proportional(12.0), color: WEAK, ..Default::default() });
+            job.append(&format!("  ·  {text}"), 0.0, TextFormat { font_id: FontId::proportional(12.0), color, ..Default::default() });
+            ui.add(egui::Label::new(job).selectable(false));
+        });
     });
 }
 
@@ -236,6 +265,7 @@ fn empty_state(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         if ui.link("Already have a .ROBLOSECURITY cookie? Add it in Settings").clicked() {
             app.nav = Nav::Settings;
+            app.settings_tab = 4;
         }
         ui.add_space(28.0);
         ui.allocate_ui(egui::vec2(560.0, 0.0), |ui| {
@@ -244,7 +274,7 @@ fn empty_state(app: &mut App, ui: &mut egui::Ui) {
                     ("1", "Add each account with + Add account."),
                     ("2", "Paste a game link (or Place ID) into the account's Game box."),
                     ("3", "Press ▶ Play — or tick several accounts and Launch them together."),
-                    ("4", "If a client crashes or disconnects, it's restarted automatically (Settings → Reconnect)."),
+                    ("4", "If a client crashes or disconnects, it's restarted automatically (Settings > Games)."),
                 ] {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(n).color(ACCENT).strong());
@@ -275,7 +305,7 @@ fn detail(app: &mut App, ui: &mut egui::Ui) {
         load_bufs(app, &acc);
     }
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        ui.set_max_width(780.0);
+        ui.set_max_width(ui.available_width().min(780.0)); // set_max_width SETS the width; never exceed the panel
         header(app, ui, &acc);
         ui.add_space(14.0);
         if acc.status == "needs_relogin" {
@@ -314,34 +344,49 @@ fn header(app: &mut App, ui: &mut egui::Ui, acc: &Account) {
     } else {
         base.to_string()
     };
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.label(RichText::new(&acc.label).size(26.0).strong());
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("@{}", acc.username)).color(WEAK));
-                pill(ui, &text, color);
+    // Narrow windows: stack the button under the name instead of squeezing it off the edge.
+    let narrow = ui.available_width() < 520.0;
+    let title = |ui: &mut egui::Ui| {
+        ui.label(RichText::new(&acc.label).size(26.0).strong());
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(format!("@{}", acc.username)).color(WEAK));
+            pill(ui, &text, color);
+        });
+    };
+    if narrow {
+        title(ui);
+        ui.add_space(4.0);
+        play_stop_big(app, ui, acc, ui.available_width().min(320.0));
+    } else {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.set_max_width(ui.available_width() - 170.0);
+                title(ui);
             });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| play_stop_big(app, ui, acc, 150.0));
         });
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if is_running(&acc.status) {
-                if ui.add(danger("⏹  Stop").min_size(egui::vec2(150.0, 42.0))).clicked() {
-                    app.engine.kill(acc.id);
-                }
-            } else {
-                let why = if acc.place_id.is_empty() {
-                    Some("Add a game below first")
-                } else if acc.status == "needs_relogin" {
-                    Some("Sign in again first")
-                } else {
-                    None
-                };
-                let r = ui.add_enabled(why.is_none(), primary("▶  Play").min_size(egui::vec2(150.0, 42.0)));
-                if r.on_disabled_hover_text(why.unwrap_or("")).clicked() {
-                    app.engine.launch(acc.id);
-                }
-            }
-        });
-    });
+    }
+}
+
+fn play_stop_big(app: &mut App, ui: &mut egui::Ui, acc: &Account, width: f32) {
+    let size = egui::vec2(width, 42.0);
+    if is_running(&acc.status) {
+        if ui.add(danger("⏹  Stop").min_size(size)).clicked() {
+            app.engine.kill(acc.id);
+        }
+    } else {
+        let why = if acc.place_id.is_empty() {
+            Some("Add a game below first")
+        } else if acc.status == "needs_relogin" {
+            Some("Sign in again first")
+        } else {
+            None
+        };
+        let r = ui.add_enabled(why.is_none(), primary("▶  Play").min_size(size));
+        if r.on_disabled_hover_text(why.unwrap_or("")).clicked() {
+            app.engine.launch(acc.id);
+        }
+    }
 }
 
 fn game_card(app: &mut App, ui: &mut egui::Ui, acc: &Account) {
@@ -386,7 +431,7 @@ fn setup_card(app: &mut App, ui: &mut egui::Ui, acc: &Account) {
     let gs = groups(app);
     card(ui, "Setup", |ui| {
         form_row(ui, "Nickname", |ui| {
-            let r = ui.add(egui::TextEdit::singleline(&mut app.edit.label).desired_width(300.0));
+            let r = ui.add(egui::TextEdit::singleline(&mut app.edit.label).desired_width(ui.available_width().min(300.0)));
             let v = app.edit.label.trim().to_string();
             if r.changed() && !v.is_empty() {
                 let _ = app.db.set_label(acc.id, &v); // saved as you type; list re-sorts when you leave the field
@@ -399,7 +444,7 @@ fn setup_card(app: &mut App, ui: &mut egui::Ui, acc: &Account) {
             }
         });
         form_row(ui, "Group", |ui| {
-            let r = ui.add(egui::TextEdit::singleline(&mut app.edit.group).hint_text("none").desired_width(190.0));
+            let r = ui.add(egui::TextEdit::singleline(&mut app.edit.group).hint_text("none").desired_width((ui.available_width() - 110.0).clamp(80.0, 190.0)));
             if r.changed() {
                 let _ = app.db.set_group(acc.id, app.edit.group.trim());
             }
@@ -419,7 +464,7 @@ fn setup_card(app: &mut App, ui: &mut egui::Ui, acc: &Account) {
                 });
             }
         });
-        form_row(ui, "Performance", |ui| {
+        form_row(ui, "Performance profile", |ui| {
             let cur = app.presets.iter().find(|p| p.id == acc.preset_id).map(|p| p.name.clone()).unwrap_or_default();
             egui::ComboBox::from_id_salt("acc-preset").selected_text(cur).width(190.0).show_ui(ui, |ui| {
                 for p in app.presets.clone() {
@@ -437,7 +482,7 @@ fn setup_card(app: &mut App, ui: &mut egui::Ui, acc: &Account) {
             });
             ui.horizontal(|ui| {
                 ui.add_space(158.0);
-                let t = if app.edit.show_preset { "Hide preset settings" } else { "Edit this preset…" };
+                let t = if app.edit.show_preset { "Hide profile settings" } else { "Edit this profile…" };
                 if ui.link(t).clicked() {
                     app.edit.show_preset = !app.edit.show_preset;
                 }
@@ -447,7 +492,7 @@ fn setup_card(app: &mut App, ui: &mut egui::Ui, acc: &Account) {
                 egui::Frame::none().fill(PANEL).rounding(8.0).inner_margin(Margin::same(12.0)).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     help(ui, &format!("Changes apply to every account using “{}”, from their next launch.", p.name));
-                    if preset_editor(ui, &mut p.gfx) {
+                    if profile_fields(ui, &mut p) {
                         let _ = app.db.save_preset(&p);
                         app.reload();
                     }
@@ -509,6 +554,7 @@ fn session_card(app: &mut App, ui: &mut egui::Ui, acc: &Account) {
                 help(ui, if verified { "Same-server rejoin is verified but turned off." } else { "Same-server rejoin is locked until verified." });
                 if ui.link("Settings").clicked() {
                     app.nav = Nav::Settings;
+                    app.settings_tab = 0;
                 }
             });
         }

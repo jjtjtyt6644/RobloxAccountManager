@@ -1,3 +1,50 @@
+# 1.3.0 — finds every Roblox window, clearer settings
+
+## New
+- Finds Roblox windows the manager didn't open: ones started from the website, by another tool, or before the manager was opened. Each is matched to its account through Roblox's own log (the user id it writes when it joins a game) and is then watched, reconnected and saved like any other. Windows of accounts that aren't in the manager are still covered by the memory and CPU savers.
+- Savers can now apply to every Roblox window, including the one you're playing (Settings > Performance > Which windows the savers apply to). The default is still background windows only.
+
+## Settings, reorganised
+- Tabs: Games, Performance, Updates, This app, Security.
+- "Presets" are now Performance profiles: each is a card showing what it does and which accounts use it. Edit opens plain controls (frame rate with quick picks, texture quality Full to Lowest, shadows, visual effects, priority) and lets you switch accounts onto it with one click. The exact texture level and frame buffer cap are under Advanced. "+ New profile" and Duplicate are there too.
+- Slider tracks and checkboxes are easier to see.
+
+# 1.2.0 — keeps your games running, one-click updates
+
+## New
+- Running games are picked up automatically. When the manager starts, including right after an update, every Roblox window it launched that is still open is tracked again (watched, reconnected, saved). There's no need to close and relaunch Roblox.
+- Updater window: when a new version is out, a window pops up as soon as you open the manager, with what's new and one "Update now" button. It shows download progress, then the manager closes and reopens on the new version by itself. "Later" hides it until next time; the green Update button in the top bar brings it back.
+- With "Install automatically" on, the update downloads and the manager reopens without asking.
+
+## Fixed
+- Arrows in help text showed as boxes.
+
+# 1.1.0 — CPU saver, lighter manager
+
+## New
+- CPU saver (Settings): Roblox windows you aren't playing in run in Windows Efficiency mode at lower priority. "Strong" also uses the lowest priority and limits each background window to 2 CPU cores. The window you click into gets full speed back within a second.
+- Memory and CPU savers now react to window switches within a second (memory trimming still runs on its own 15 / 5 / 3 s schedule).
+
+## The manager itself
+- "Keep the manager light in the background" (on by default): Efficiency mode while it isn't the active window; while minimized it doesn't draw at all (0% GPU) and its memory drops from about 80 MB to about 3 MB.
+- Process scans read only what they need (names and start times, plus memory for running clients) instead of CPU, disk and file info for every process on the PC.
+- Smaller database cache.
+
+# 1.0.0 — first stable release
+
+## New
+- About screen: version, links, update status and this changelog.
+- Updates: Settings > Updates checks this project's GitHub releases for a newer manager. One click downloads and installs it; restart to finish. Optional: check on start, and install automatically.
+- Roblox updater: Settings > Updates shows your installed Roblox version and the latest one, and "Update Roblox" runs Roblox's official installer for the latest version.
+- An "Update" button appears in the top bar when a new manager version is out.
+- One download: the sign-in helper (ram-login.exe) is now built into the manager, so roblox_account_manager.exe is the only file you need.
+
+## Fixed
+- The account page no longer runs off the right edge of the window (its width was forced to 780 px even in smaller windows).
+- Refined look: cleaner tab switcher, card-style account rows with left-aligned names, square checkboxes. Double-click an account to play.
+- Small windows: Play / Stop buttons on account rows and on the account page no longer get cut off. Rows shrink to icon buttons, the account page stacks its Play button under the name, and the top bar drops the title and counts before the buttons.
+- The window can now be made smaller (720 × 480).
+
 # 0.3.0 — memory saver, multi-client fix, clearer settings
 
 ## Several accounts at once (fix)

@@ -36,6 +36,11 @@ pub fn event_info(event: &str) -> (&'static str, Color32, bool) {
         "probe" => ("Rejoin check", ACCENT, false),
         "diagnostic" => ("Diagnostic", ACCENT, false),
         "multi_instance" => ("Several accounts", ACCENT, false),
+        "update" => ("Manager updated", GREEN, false),
+        "adopted" => ("Picked up running game", GREEN, false),
+        "detected" => ("Found running game", GREEN, false),
+        "roblox_update" => ("Roblox updated", GREEN, false),
+        "update_failed" => ("Update failed", RED, true),
         _ => ("Event", GREY, false),
     }
 }
@@ -80,17 +85,19 @@ pub fn help(ui: &mut egui::Ui, text: &str) {
 pub fn primary(text: &str) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.to_owned()).color(Color32::WHITE).strong())
         .fill(ACCENT)
+        .rounding(8.0)
         .min_size(egui::vec2(0.0, 32.0))
 }
 
 pub fn danger(text: &str) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.to_owned()).color(Color32::WHITE).strong())
         .fill(Color32::from_rgb(170, 52, 52))
+        .rounding(8.0)
         .min_size(egui::vec2(0.0, 30.0))
 }
 
 pub fn subtle(text: &str) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text.to_owned())).min_size(egui::vec2(0.0, 30.0))
+    egui::Button::new(RichText::new(text.to_owned())).rounding(8.0).min_size(egui::vec2(0.0, 30.0))
 }
 
 /// Two-column "label | control" row with a fixed label width, so forms line up.
@@ -176,4 +183,41 @@ pub fn explain(ui: &mut egui::Ui, title: &str, body: &str, cost: &str) {
                 ui.label(RichText::new(cost).color(WEAK).size(12.5));
             }
         });
+}
+
+/// Segmented tab switcher, painted by hand so it stays exactly 36 px tall whatever layout it's in.
+/// Returns the index clicked, if any.
+pub fn segmented(ui: &mut egui::Ui, items: &[&str], selected: usize) -> Option<usize> {
+    let font = egui::FontId::proportional(14.0);
+    let pad = egui::vec2(14.0, 0.0);
+    let galleys: Vec<_> = items
+        .iter()
+        .map(|t| ui.painter().layout_no_wrap(t.to_string(), font.clone(), TEXT))
+        .collect();
+    let inner = 3.0;
+    let w: f32 = galleys.iter().map(|g| g.size().x + pad.x * 2.0).sum::<f32>() + inner * 2.0;
+    let (rect, whole) = ui.allocate_exact_size(egui::vec2(w, 36.0), egui::Sense::hover());
+    let p = ui.painter().clone();
+    p.rect(rect, Rounding::same(10.0), BG, Stroke::new(1.0, BORDER));
+    let mut x = rect.left() + inner;
+    let mut clicked = None;
+    for (i, g) in galleys.into_iter().enumerate() {
+        let tw = g.size().x + pad.x * 2.0;
+        let r = egui::Rect::from_min_size(egui::pos2(x, rect.top() + inner), egui::vec2(tw, rect.height() - inner * 2.0));
+        // Ids derive from this control's own allocation, so several switchers can share a parent.
+        let resp = ui.interact(r, whole.id.with(("seg", i)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let on = i == selected;
+        if on {
+            p.rect_filled(r, Rounding::same(7.0), Color32::from_rgb(34, 39, 49));
+        } else if resp.hovered() {
+            p.rect_filled(r, Rounding::same(7.0), Color32::from_rgb(24, 28, 35));
+        }
+        let color = if on { Color32::WHITE } else if resp.hovered() { TEXT } else { WEAK };
+        p.galley_with_override_text_color(r.center() - g.size() / 2.0, g, color);
+        if resp.clicked() && !on {
+            clicked = Some(i);
+        }
+        x += tw;
+    }
+    clicked
 }

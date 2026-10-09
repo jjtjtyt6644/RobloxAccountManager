@@ -4,11 +4,11 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 fn alive(pid: u32) -> bool {
     let mut s = System::new();
-    s.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
+    s.refresh_processes_specifics(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true, ProcessRefreshKind::new());
     s.process(Pid::from_u32(pid)).is_some()
 }
 
@@ -28,7 +28,7 @@ pub fn graceful_close(pid: u32) {
     }
     std::thread::sleep(Duration::from_secs(2));
     let mut s = System::new();
-    s.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
+    s.refresh_processes_specifics(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true, ProcessRefreshKind::new());
     if let Some(p) = s.process(Pid::from_u32(pid)) {
         p.kill();
     }
@@ -45,6 +45,11 @@ pub fn logs_dir() -> Option<PathBuf> {
 }
 
 impl LogTail {
+    /// Follow a specific log from byte `pos` (0 = from the start).
+    pub fn at(path: PathBuf, pos: u64) -> LogTail {
+        LogTail { path, pos }
+    }
+
     /// Newest Player log created at/after launch time and not already claimed by another account.
     pub fn claim(launch_ts: u64, claimed: &HashSet<PathBuf>) -> Option<LogTail> {
         let min = UNIX_EPOCH + Duration::from_secs(launch_ts.saturating_sub(5));

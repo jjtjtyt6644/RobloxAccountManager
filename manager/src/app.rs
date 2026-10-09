@@ -1,10 +1,12 @@
 use crate::launcher::Engine;
 use crate::runtime::mem;
 use crate::storage::db::*;
-use crate::{runtime, ui, watcher};
+use crate::{runtime, ui, update, watcher};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui;
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(PartialEq, Clone, Copy)]
@@ -12,6 +14,7 @@ pub enum Nav {
     Accounts,
     Activity,
     Settings,
+    About,
 }
 
 #[derive(PartialEq, Clone)]
@@ -22,16 +25,24 @@ pub enum GroupFilter {
 }
 
 /// Background threads call ping() -> UI wakes up and reloads from the DB. The UI never polls, so an
-/// idle manager does no work at all.
+/// idle manager does no work at all. While the window is minimized (and "keep light" is on) no repaint
+/// is requested: the pings queue up and are applied when the window is opened again.
 #[derive(Clone)]
 pub struct UiTx {
     pub tx: Sender<()>,
     pub ctx: egui::Context,
+    pub hidden: Arc<AtomicBool>,
 }
 impl UiTx {
     pub fn ping(&self) {
         let _ = self.tx.send(());
-        self.ctx.request_repaint();
+        self.repaint();
+    }
+    /// Redraw only (no DB reload), e.g. new memory figures.
+    pub fn repaint(&self) {
+        if !self.hidden.load(Ordering::SeqCst) {
+            self.ctx.request_repaint();
+        }
     }
 }
 
@@ -70,6 +81,14 @@ pub struct App {
     pub log_problems_only: bool,
     pub mem: Option<mem::Mem>,
     mem_at: Instant,
+    /// Set by "Restart now" after an update: skip "close clients on exit" so games keep running.
+    pub restarting: bool,
+    self_mode: runtime::selfmode::SelfMode,
+    /// Release tag whose updater window the user closed with "Later".
+    pub update_dismissed: Option<String>,
+    /// Settings tab (index into ui::settings_view::TABS) and the profile card that's open for editing.
+    pub settings_tab: usize,
+    pub open_profile: Option<i64>,
 }
 
 impl App {
@@ -85,13 +104,22 @@ impl App {
             .expect("tokio runtime");
         let (tx, rx) = unbounded();
         let (wake_tx, wake_rx) = unbounded();
-        let engine = Engine::new(db.clone(), rt.handle().clone(), UiTx { tx, ctx: cc.egui_ctx.clone() }, wake_tx);
+        let engine = Engine::new(db.clone(), rt.handle().clone(), UiTx { tx, ctx: cc.egui_ctx.clone(), hidden: Default::default() }, wake_tx);
         watcher::process::spawn(engine.clone(), wake_rx);
         runtime::trim::spawn(engine.clone());
         spawn_idle_memory_sample(engine.clone());
 
         let multi = engine.settings.read().unwrap().multi_instance;
         engine.set_multi_instance(multi);
+        update::app_update::cleanup_old();
+        // The previous copy may still be closing (after an update restart); try again shortly.
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(10));
+            update::app_update::cleanup_old();
+        });
+        engine.adopt_running();
+        watcher::detect::spawn(engine.clone());
+        spawn_startup_update_check(engine.clone());
         let mut app = App {
             engine,
             db,
@@ -116,13 +144,41 @@ impl App {
             log_problems_only: false,
             mem: mem::current(),
             mem_at: Instant::now(),
+            restarting: false,
+            self_mode: Default::default(),
+            update_dismissed: None,
+            settings_tab: 0,
+            open_profile: None,
         };
+        // Debug builds only: RAM_DEV_TAB=<n> opens Settings on tab n (for screenshots in testing).
+        #[cfg(debug_assertions)]
+        if let Some(t) = std::env::var("RAM_DEV_TAB").ok().and_then(|v| v.parse().ok()) {
+            app.nav = Nav::Settings;
+            app.settings_tab = t;
+            app.open_profile = Some(1);
+        }
         app.reload();
         if let Some(p) = app.presets.first() {
             app.sel_preset = p.id;
         }
         app.selected = app.accounts.first().map(|a| a.id);
         app
+    }
+
+    /// Starts the (updated) exe and closes this one. Running Roblox windows stay open.
+    pub fn restart(&mut self, ctx: &egui::Context) {
+        self.engine.updates.lock().unwrap().restart_now = false;
+        let started = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).spawn());
+        match started {
+            Ok(_) => {
+                self.restarting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(e) => {
+                self.engine.updates.lock().unwrap().app =
+                    update::Job::Failed(format!("Installed, but couldn't reopen the manager ({e}). Please open it again yourself."));
+            }
+        }
     }
 
     pub fn reload(&mut self) {
@@ -140,6 +196,21 @@ impl App {
             self.logs = ev;
         }
     }
+}
+
+/// A few seconds after start (if enabled): check GitHub for a new manager version and Roblox for a new
+/// player version. Only the manager is ever installed automatically, and only when the user opted in.
+fn spawn_startup_update_check(engine: Engine) {
+    let s = engine.settings.read().unwrap().clone();
+    if !s.check_updates_on_start {
+        return;
+    }
+    let e = engine.clone();
+    engine.rt.spawn(async move {
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        e.check_app_update(s.auto_install_updates);
+        e.check_roblox_update();
+    });
 }
 
 /// One-shot: 5 minutes after start, record this process's memory in the Activity log. If nothing was
@@ -176,16 +247,22 @@ impl eframe::App for App {
         if dirty {
             self.reload();
         }
+        let (focused, minimized) = ctx.input(|i| (i.viewport().focused.unwrap_or(true), i.viewport().minimized.unwrap_or(false)));
+        let light = self.engine.settings.read().unwrap().manager_light;
+        self.self_mode.update(&self.engine.ui, light, focused, minimized);
         // Only refreshed when we're repainting anyway (input or a ping) — never schedules a repaint.
         if self.mem_at.elapsed() > Duration::from_secs(2) {
             self.mem = mem::current();
             self.mem_at = Instant::now();
         }
+        if self.engine.updates.lock().unwrap().restart_now && !self.restarting {
+            self.restart(ctx);
+        }
         ui::draw(self, ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if self.engine.settings.read().unwrap().kill_on_exit {
+        if !self.restarting && self.engine.settings.read().unwrap().kill_on_exit {
             self.engine.kill_all_blocking();
         }
     }

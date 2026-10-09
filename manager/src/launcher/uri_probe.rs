@@ -56,7 +56,7 @@ impl ProbeReport {
             ),
             None => format!(
                 "Not verified: found {} launch link(s) ({} were this manager's own, {} were normal joins), but \
-                 none was a join to a specific server. On roblox.com open a game → Servers → Join, then check again.",
+                 none was a join to a specific server. On roblox.com open a game > Servers > Join, then check again.",
                 self.uris_seen, self.own_skipped, self.plain_only
             ),
         }

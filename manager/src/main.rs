@@ -6,6 +6,7 @@ mod launcher;
 mod runtime;
 mod storage;
 mod ui;
+mod update;
 mod watcher;
 
 use eframe::egui;
@@ -13,9 +14,9 @@ use eframe::egui;
 fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Roblox Account Manager")
+            .with_title(format!("Roblox Account Manager v{}", update::VERSION))
             .with_inner_size([1080.0, 680.0])
-            .with_min_inner_size([820.0, 520.0]),
+            .with_min_inner_size([720.0, 480.0]),
         ..Default::default()
     };
     eframe::run_native(

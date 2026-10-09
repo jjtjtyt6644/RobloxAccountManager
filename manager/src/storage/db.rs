@@ -59,6 +59,17 @@ pub enum TrimMode {
     Max,
 }
 
+/// CPU saver level for background Roblox clients (runtime::trim). The foreground window is never throttled.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Debug)]
+pub enum CpuMode {
+    #[default]
+    Off,
+    /// Windows Efficiency mode (EcoQoS) + below-normal priority.
+    Efficiency,
+    /// Efficiency + idle priority + at most 2 CPU cores.
+    Strong,
+}
+
 /// `#[serde(default)]`: settings saved by an older version (missing new fields) still load instead of
 /// silently resetting everything to defaults.
 #[derive(Clone, Serialize, Deserialize)]
@@ -72,6 +83,11 @@ pub struct Settings {
     pub trim_mode: TrimMode,
     /// Per background client, in MB.
     pub trim_target_mb: u32,
+    pub cpu_saver: CpuMode,
+    /// Savers also apply to the window you're playing in (default: background windows only).
+    pub saver_all_windows: bool,
+    /// Manager itself: Efficiency mode while unfocused, no redraws and a memory trim while minimized.
+    pub manager_light: bool,
     /// Pre-0.3 on/off switch. Read once to migrate to `trim_mode`, never written back.
     #[serde(skip_serializing)]
     pub trim_enabled: bool,
@@ -81,6 +97,10 @@ pub struct Settings {
     /// Rejoin the previous server on reconnect. Only honoured once a real launch URI has been captured
     /// and verified (see launcher::uri_probe); best-effort even then.
     pub same_server_rejoin: bool,
+    /// Look for a new manager version (and Roblox version) a few seconds after start.
+    pub check_updates_on_start: bool,
+    /// Install a new manager version found by that check without asking (applies on next start).
+    pub auto_install_updates: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -92,10 +112,15 @@ impl Default for Settings {
             retry_on_auth_fail: false,
             trim_mode: TrimMode::Off,
             trim_target_mb: 100,
+            cpu_saver: CpuMode::Off,
+            saver_all_windows: false,
+            manager_light: true,
             trim_enabled: false,
             kill_on_exit: false,
             multi_instance: true,
             same_server_rejoin: false,
+            check_updates_on_start: true,
+            auto_install_updates: false,
         }
     }
 }
@@ -120,6 +145,9 @@ CREATE TABLE IF NOT EXISTS presets(
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, flags_json TEXT NOT NULL,
   priority INTEGER NOT NULL DEFAULT 1, trim_interval_sec INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS live_clients(
+  account_id INTEGER PRIMARY KEY, pid INTEGER NOT NULL, start_time INTEGER NOT NULL,
+  launch_ts INTEGER NOT NULL, live_since INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS launch_events(
   id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, ts INTEGER NOT NULL,
   event TEXT NOT NULL, detail TEXT NOT NULL);
@@ -151,7 +179,16 @@ impl Db {
         let dir = Self::dir();
         std::fs::create_dir_all(&dir)?;
         let c = Connection::open(dir.join("accounts.db"))?;
+        // The DB is tiny; SQLite's default page cache (~2 MB) is far more than it needs.
+        c.execute_batch("PRAGMA cache_size=-256; PRAGMA temp_store=MEMORY;")?;
         c.execute_batch(SCHEMA)?;
+        // Added in 1.3.0: Roblox user id, used to recognise clients the manager didn't start.
+        let has_uid: bool = c
+            .prepare("SELECT 1 FROM pragma_table_info('accounts') WHERE name='user_id'")?
+            .exists([])?;
+        if !has_uid {
+            c.execute_batch("ALTER TABLE accounts ADD COLUMN user_id INTEGER;")?;
+        }
         let n: i64 = c.query_row("SELECT COUNT(*) FROM presets", [], |r| r.get(0))?;
         if n == 0 {
             let seeds = [
@@ -242,8 +279,46 @@ impl Db {
     pub fn reset_statuses(&self) {
         let _ = self.c().execute("UPDATE accounts SET status='idle' WHERE status<>'needs_relogin'", []);
     }
+    // ---------- Roblox user ids ----------
+    pub fn set_user_id(&self, id: i64, uid: u64) {
+        let _ = self.c().execute("UPDATE accounts SET user_id=?1 WHERE id=?2", params![uid as i64, id]);
+    }
+    /// (account id, username) of accounts whose user id isn't known yet.
+    pub fn missing_user_ids(&self) -> Vec<(i64, String)> {
+        let c = self.c();
+        let Ok(mut st) = c.prepare("SELECT id,username FROM accounts WHERE user_id IS NULL OR user_id=0") else { return vec![] };
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map(|it| it.flatten().collect()).unwrap_or_default()
+    }
+    pub fn account_by_user_id(&self, uid: u64) -> Option<i64> {
+        self.c().query_row("SELECT id FROM accounts WHERE user_id=?1", [uid as i64], |r| r.get(0)).ok()
+    }
+
+    // ---------- running clients (survive a manager restart) ----------
+    pub fn save_live(&self, id: i64, pid: u32, start_time: u64, launch_ts: u64, live_since: i64) {
+        let _ = self.c().execute(
+            "INSERT OR REPLACE INTO live_clients(account_id,pid,start_time,launch_ts,live_since) VALUES(?1,?2,?3,?4,?5)",
+            params![id, pid, start_time as i64, launch_ts as i64, live_since],
+        );
+    }
+    pub fn del_live(&self, id: i64) {
+        let _ = self.c().execute("DELETE FROM live_clients WHERE account_id=?1", [id]);
+    }
+    /// (account id, pid, start time, launch ts, live since)
+    pub fn list_live(&self) -> Vec<(i64, u32, u64, u64, i64)> {
+        let c = self.c();
+        let Ok(mut st) = c.prepare("SELECT account_id,pid,start_time,launch_ts,live_since FROM live_clients") else {
+            return vec![];
+        };
+        st.query_map([], |r| {
+            Ok((r.get(0)?, r.get::<_, i64>(1)? as u32, r.get::<_, i64>(2)? as u64, r.get::<_, i64>(3)? as u64, r.get(4)?))
+        })
+        .map(|it| it.flatten().collect())
+        .unwrap_or_default()
+    }
+
     pub fn delete_account(&self, id: i64) -> Res<()> {
         let c = self.c();
+        c.execute("DELETE FROM live_clients WHERE account_id=?1", [id])?;
         c.execute("DELETE FROM accounts WHERE id=?1", [id])?;
         c.execute("DELETE FROM launch_events WHERE account_id=?1", [id])?;
         Ok(())

@@ -31,7 +31,9 @@ pub fn apply(ctx: &egui::Context) {
     v.window_stroke = Stroke::new(1.0, BORDER);
 
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(38, 43, 52));
+    // Visible edges for checkboxes, text fields and slider rails on the dark cards.
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(62, 69, 82));
+    v.slider_trailing_fill = true;
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
     let base = Color32::from_rgb(28, 32, 39);
     let hover = Color32::from_rgb(38, 43, 52);
@@ -49,7 +51,8 @@ pub fn apply(ctx: &egui::Context) {
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        w.rounding = Rounding::same(8.0);
+        // Small radius so checkboxes stay square; buttons set their own larger radius (widgets.rs).
+        w.rounding = Rounding::same(5.0);
     }
     ctx.set_visuals(v);
 
@@ -59,6 +62,7 @@ pub fn apply(ctx: &egui::Context) {
         s.spacing.button_padding = egui::vec2(14.0, 6.0);
         s.spacing.interact_size.y = 30.0;
         s.spacing.combo_width = 200.0;
+        s.spacing.slider_width = 200.0;
         s.spacing.text_edit_width = 260.0;
         s.text_styles = [
             (TextStyle::Heading, FontId::proportional(22.0)),

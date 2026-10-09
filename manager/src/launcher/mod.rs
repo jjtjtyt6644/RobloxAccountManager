@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use sysinfo::{ProcessesToUpdate, System};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 use uri_probe::UriSchema;
 use zeroize::Zeroizing;
 
@@ -47,11 +47,14 @@ pub struct Engine {
     pub probe_note: Arc<Mutex<String>>,
     /// Held while "Run several accounts at once" is on (runtime::singleton).
     pub singleton: Arc<Mutex<Option<SingletonGuard>>>,
+    pub updates: Arc<Mutex<crate::update::Updates>>,
+    /// Roblox clients that aren't tracked for an account (watcher::detect).
+    pub others: Arc<Mutex<Vec<crate::watcher::detect::OtherClient>>>,
 }
 
 fn roblox_pids() -> Vec<u32> {
     let mut sys = System::new();
-    sys.refresh_processes(ProcessesToUpdate::All, true);
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::new());
     sys.processes()
         .values()
         .filter(|p| p.name().to_string_lossy().eq_ignore_ascii_case("RobloxPlayerBeta.exe"))
@@ -61,7 +64,7 @@ fn roblox_pids() -> Vec<u32> {
 
 fn find_new_client(since_secs: u64, taken: &HashSet<u32>) -> Option<(u32, u64)> {
     let mut sys = System::new();
-    sys.refresh_processes(ProcessesToUpdate::All, true);
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::new());
     sys.processes()
         .values()
         .filter(|p| {
@@ -92,6 +95,8 @@ impl Engine {
             last_bind: Default::default(),
             probe_note: Default::default(),
             singleton: Default::default(),
+            updates: Default::default(),
+            others: Default::default(),
         }
     }
 
@@ -108,12 +113,77 @@ impl Engine {
     }
     pub fn clear(&self, id: i64, status: &str) {
         self.tr().remove(&id);
+        self.db.del_live(id);
         self.set_status(id, status);
     }
     /// Is launch `gen` still the live intent for this account (not stopped, not superseded)?
     fn current(&self, id: i64, gen: u64) -> bool {
         self.tr().get(&id).map_or(false, |e| e.gen == gen && !e.user_killed)
     }
+    // ---------- pick up clients that are already running ----------
+    /// At start-up: every client this manager (or the previous copy, e.g. before an update restart)
+    /// launched and that is still running is tracked again — watched, reconnected, saved — without
+    /// relaunching it. A client counts as the same one only if its PID AND start time still match,
+    /// so a recycled PID is never mistaken for it.
+    pub fn adopt_running(&self) -> usize {
+        let rows = self.db.list_live();
+        if rows.is_empty() {
+            return 0;
+        }
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::new());
+        let presets = self.db.list_presets().unwrap_or_default();
+        let mut n = 0;
+        for (id, pid, st, launch_ts, since) in rows {
+            let alive = sys.process(sysinfo::Pid::from_u32(pid)).map_or(false, |p| {
+                p.start_time() == st && p.name().to_string_lossy().eq_ignore_ascii_case("RobloxPlayerBeta.exe")
+            });
+            let Ok(acc) = self.db.get_account(id).map_err(|_| ()).and_then(|a| if alive { Ok(a) } else { Err(()) }) else {
+                self.db.del_live(id);
+                continue;
+            };
+            let base_priority = presets.iter().find(|p| p.id == acc.preset_id).map_or(1, |p| p.priority);
+            self.track_existing(id, pid, st, launch_ts, since, base_priority, None);
+            self.log(id, "adopted", &format!("already running (PID {pid}) — picked up without restarting it"));
+            n += 1;
+        }
+        if n > 0 {
+            let _ = self.wake.send(());
+            self.ui.ping();
+        }
+        n
+    }
+
+    /// Start tracking a client that's already running (adopted at start-up or detected later).
+    /// `log`: its Roblox log, read from the current end so old lines don't count as a disconnect.
+    pub fn track_existing(
+        &self,
+        id: i64,
+        pid: u32,
+        st: u64,
+        launch_ts: u64,
+        since: i64,
+        base_priority: i32,
+        log: Option<crate::watcher::crash_detect::LogTail>,
+    ) {
+        {
+            let mut t = self.tr();
+            let e = t.entry(id).or_default();
+            e.gen = self.gen.fetch_add(1, Ordering::SeqCst) + 1;
+            e.pid = Some(pid);
+            e.start_time = st;
+            e.launch_ts = launch_ts;
+            e.state = State::Live;
+            e.user_killed = false;
+            e.live_since = Some(Instant::now());
+            e.live_since_ts = since;
+            e.base_priority = base_priority;
+            e.log = log;
+        }
+        self.db.save_live(id, pid, st, launch_ts, since);
+        let _ = self.db.set_status(id, "live");
+    }
+
     // ---------- several clients at once ----------
     pub fn set_multi_instance(&self, on: bool) {
         *self.singleton.lock().unwrap() = on.then(singleton::acquire);
@@ -151,7 +221,7 @@ impl Engine {
                     e.clear(id, "idle");
                 }
                 let mut sys = System::new();
-                sys.refresh_processes(ProcessesToUpdate::All, true);
+                sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::new());
                 for p in sys.processes().values() {
                     if p.name().to_string_lossy().eq_ignore_ascii_case("RobloxPlayerBeta.exe") {
                         p.kill();
@@ -195,7 +265,7 @@ impl Engine {
                     let (ev, msg) = match er {
                         LoginErr::Cancelled => ("login_cancelled", "sign-in window closed before signing in".to_string()),
                         LoginErr::HelperMissing(p) => {
-                            ("add_failed", format!("{} is missing — it must sit next to the manager exe", p.display()))
+                            ("add_failed", format!("sign-in helper not found at {} — this build doesn't include it; rebuild with scripts\\build-release.ps1", p.display()))
                         }
                         LoginErr::Failed(m) => ("add_failed", m),
                     };
@@ -212,8 +282,13 @@ impl Engine {
         self.login_busy.store(true, Ordering::SeqCst);
         self.rt.spawn(async move {
             match ticket::whoami(&e.http, &cookie).await {
-                Ok(name) => match e.db.upsert_account(&name, &cookie) {
-                    Ok(id) => e.log(id, "account_added", &name),
+                Ok((uid, name)) => match e.db.upsert_account(&name, &cookie) {
+                    Ok(id) => {
+                        if uid != 0 {
+                            e.db.set_user_id(id, uid);
+                        }
+                        e.log(id, "account_added", &name)
+                    }
                     Err(er) => e.log(0, "add_failed", &er.to_string()),
                 },
                 Err(er) => e.log(0, "add_failed", &er),
@@ -423,7 +498,9 @@ impl Engine {
             e.state = State::Live;
             e.live_since = Some(Instant::now());
             e.live_since_ts = now();
+            e.base_priority = preset.priority;
         }
+        self.db.save_live(id, pid, st, ts, now());
         *self.last_bind.lock().unwrap() = Some((id, Instant::now()));
         priority::apply(pid, preset.priority);
         self.db.touch_used(id);

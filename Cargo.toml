@@ -1,0 +1,15 @@
+[workspace]
+# Two binaries, two dependency graphs:
+#   manager/ -> roblox_account_manager.exe  (egui UI, launcher, watcher)   NO tao / wry / WebView2
+#   login/   -> ram-login.exe               (sign-in window only)          tao + wry live here and nowhere else
+# Verify with:  cargo tree -p roblox_account_manager -e normal | findstr /i "tao wry webview2"   (must print nothing)
+members = ["manager", "login"]
+resolver = "2"
+
+# Profiles must live at the workspace root; per-member [profile] sections are ignored.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

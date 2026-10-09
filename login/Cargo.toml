@@ -1,0 +1,14 @@
+[package]
+name = "ram-login"
+version = "0.2.0"
+edition = "2021"
+
+# The ONLY crate in the workspace that links the webview stack.
+# Spawned by the manager for one sign-in, then exits so the OS reclaims all webview memory.
+[dependencies]
+wry = "0.47"
+tao = "0.30"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console"]

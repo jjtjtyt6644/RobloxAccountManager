@@ -31,6 +31,24 @@ pub struct Tracked {
     pub user_killed: bool,
     pub log: Option<crash_detect::LogTail>,
     pub job_captured: bool,
+    /// The log has shown this client inside a game at least once.
+    pub joined: bool,
+    /// A disconnect seen in the log, acted on after a short grace period unless the client rejoins
+    /// (a teleport, or Roblox's own Reconnect button) in the meantime.
+    pub pending_fail: Option<(Instant, String)>,
+    /// Main window has been "not responding" since.
+    pub hung_since: Option<Instant>,
+    /// Launched with no game (Roblox home screen): being on the home screen is expected, not a failure.
+    pub home_launch: bool,
+    /// The last place this window was seen joining (its log), so a reconnect can go back there even
+    /// when the account has no game set.
+    pub last_place: Option<String>,
+    /// Game the window is in (universe id from its log), for "Playing …".
+    pub universe: Option<u64>,
+    /// Account name for the window title ("Roblox — Main").
+    pub title: String,
+    /// Already told the user which profile settings Roblox refused for this window.
+    pub denied_reported: bool,
     /// Last measured working set, bytes (watcher tick / memory saver).
     pub mem_ws: u64,
     pub mem_note: crate::runtime::trim::MemNote,

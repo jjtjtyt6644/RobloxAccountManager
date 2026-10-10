@@ -1,10 +1,18 @@
-use super::crash_detect::{self, LogTail};
+use super::crash_detect::{self, LogEvent, LogTail};
 use super::{winscan, State};
 use crate::launcher::Engine;
 use crossbeam_channel::Receiver;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// After a disconnect line, wait this long for a rejoin (teleport / Roblox's Reconnect) before acting.
+const REJOIN_GRACE: Duration = Duration::from_secs(10);
+/// A freshly launched client that hasn't joined a game by then is stuck (error prompt, full server…).
+const JOIN_TIMEOUT: Duration = Duration::from_secs(180);
+/// Main window "not responding" this long = frozen.
+const HUNG_FOR: Duration = Duration::from_secs(60);
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// One watcher thread for all clients. Blocks on a channel when nothing is tracked (0% CPU),
@@ -32,6 +40,8 @@ pub fn spawn(engine: Engine, rx: Receiver<()>) {
         .expect("spawn watcher thread");
 }
 
+static TICKS: AtomicU64 = AtomicU64::new(0);
+
 impl Engine {
     fn tick(&self, sys: &mut System) {
         let s = self.settings.read().unwrap().clone();
@@ -45,15 +55,20 @@ impl Engine {
         if snap.is_empty() {
             return;
         }
+        // Every tick (1 s): is it alive, and new log lines (disconnects need to be noticed quickly).
+        // Every 2nd tick: window checks (error dialogs, frozen, titles). Every 5th: memory figures.
+        let n = TICKS.fetch_add(1, Ordering::Relaxed);
+        let (scan_windows, with_mem) = (n % 2 == 0, n % 5 == 0);
         let pids: Vec<Pid> = snap.iter().map(|x| Pid::from_u32(x.1)).collect();
-        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true, ProcessRefreshKind::new().with_memory());
+        let kind = if with_mem { ProcessRefreshKind::new().with_memory() } else { ProcessRefreshKind::new() };
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true, kind);
         let tracked: Vec<u32> = snap.iter().map(|x| x.1).collect();
-        let wins = winscan::scan(&tracked);
+        let wins = if scan_windows { winscan::scan(&tracked) } else { Vec::new() };
         let mut fails: Vec<(i64, u32, String, bool)> = vec![];
 
         for (id, pid, st) in snap {
             let proc_ = sys.process(Pid::from_u32(pid)).filter(|p| p.start_time() == st);
-            if let Some(p) = proc_ {
+            if let Some(p) = proc_.filter(|_| with_mem) {
                 if let Some(e) = self.tr().get_mut(&id) {
                     e.mem_ws = p.memory();
                 }
@@ -66,11 +81,42 @@ impl Engine {
                 fails.push((id, pid, format!("error window detected — {what}"), true));
                 continue;
             }
-            if !(s.log_tail || rejoin_on) {
+            // Frozen: the main window has been "not responding" for a while.
+            if s.detect_disconnects && scan_windows {
+                let hung = winscan::main_window_hung(&wins, pid);
+                let mut t = self.tr();
+                if let Some(e) = t.get_mut(&id) {
+                    match (hung, e.hung_since) {
+                        (true, None) => e.hung_since = Some(Instant::now()),
+                        (true, Some(since)) if since.elapsed() >= HUNG_FOR => {
+                            drop(t);
+                            fails.push((id, pid, format!("stopped responding for {} s", HUNG_FOR.as_secs()), true));
+                            continue;
+                        }
+                        (false, Some(_)) => e.hung_since = None,
+                        _ => {}
+                    }
+                }
+            }
+            // Name the game window after its account so windows can be told apart on the taskbar.
+            if let Some((h, text)) = winscan::main_window(&wins, pid) {
+                let title = self.tr().get(&id).map(|t| t.title.clone()).unwrap_or_default();
+                let want = if s.title_windows && !title.is_empty() {
+                    format!("{}{title}", winscan::TITLE_PREFIX)
+                } else {
+                    "Roblox".to_string()
+                };
+                if text != want {
+                    winscan::set_title(h, &want);
+                }
+            }
+            if !(s.detect_disconnects || rejoin_on) {
                 continue;
             }
             let mut job: Option<String> = None;
-            let mut disc = false;
+            let mut fail: Option<String> = None;
+            let mut new_game: Option<u64> = None;
+            let mut denied: Vec<String> = vec![];
             {
                 let mut t = self.tr();
                 let claimed: HashSet<PathBuf> =
@@ -80,21 +126,59 @@ impl Engine {
                     if e.attempts > 0 && e.live_since.map_or(false, |l| l.elapsed() >= Duration::from_secs(60)) {
                         e.attempts = 0;
                     }
-                    let want_job = rejoin_on && !e.job_captured;
-                    if e.log.is_none() && (want_job || s.log_tail) {
-                        e.log = LogTail::claim(e.launch_ts, &claimed);
+                    if e.log.is_none() {
+                        e.log = LogTail::for_process(e.start_time, &claimed).or_else(|| LogTail::claim(e.launch_ts, &claimed));
                     }
-                    if want_job || s.log_tail {
-                        if let Some(l) = e.log.as_mut() {
-                            let txt = l.read_new();
-                            if want_job {
-                                if let Some(j) = crash_detect::find_job_id(&txt) {
-                                    job = Some(j);
-                                    e.job_captured = true;
+                    let want_job = rejoin_on && !e.job_captured;
+                    if let Some(l) = e.log.as_mut() {
+                        let txt = l.read_new();
+                        if want_job {
+                            if let Some(j) = crash_detect::find_job_id(&txt) {
+                                job = Some(j);
+                                e.job_captured = true;
+                            }
+                        }
+                        if let Some(p) = crash_detect::find_place(&txt) {
+                            e.last_place = Some(p);
+                        }
+                        if !e.denied_reported {
+                            let d = crash_detect::find_denied(&txt);
+                            if !d.is_empty() {
+                                e.denied_reported = true;
+                                denied = d;
+                            }
+                        }
+                        if let Some(u) = crash_detect::find_universe(&txt) {
+                            if e.universe != Some(u) {
+                                e.universe = Some(u);
+                                new_game = Some(u);
+                            }
+                        }
+                        if s.detect_disconnects {
+                            // Replay in order: a later join cancels an earlier disconnect (teleports,
+                            // Roblox's own Reconnect button).
+                            for ev in crash_detect::scan_events(&txt) {
+                                match ev {
+                                    LogEvent::Joined => {
+                                        e.joined = true;
+                                        e.pending_fail = None;
+                                    }
+                                    LogEvent::Disconnected(r) if e.pending_fail.is_none() => {
+                                        e.pending_fail = Some((Instant::now(), format!("disconnected from the game — {r}")));
+                                    }
+                                    LogEvent::LeftToHome if s.reopen_if_left && !e.home_launch && e.pending_fail.is_none() => {
+                                        e.pending_fail =
+                                            Some((Instant::now(), "left the game — back on the Roblox home screen".into()));
+                                    }
+                                    _ => {}
                                 }
                             }
-                            if s.log_tail && crash_detect::has_disconnect(&txt) {
-                                disc = true;
+                            if let Some((at, r)) = &e.pending_fail {
+                                if at.elapsed() >= REJOIN_GRACE {
+                                    fail = Some(r.clone());
+                                }
+                            } else if !e.joined && !e.home_launch && e.live_since.map_or(false, |l| l.elapsed() >= JOIN_TIMEOUT) {
+                                fail = Some(format!("didn't get into the game within {} minutes", JOIN_TIMEOUT.as_secs() / 60));
                             }
                         }
                     }
@@ -104,8 +188,15 @@ impl Engine {
                 let _ = self.db.set_job(id, Some(&j));
                 self.ui.ping();
             }
-            if disc {
-                fails.push((id, pid, "disconnect found in Roblox log".into(), true));
+            if !denied.is_empty() {
+                self.log(id, "denied", &format!("Roblox ignored these profile settings: {}", denied.join(", ")));
+            }
+            if let Some(u) = new_game {
+                self.game_name(u); // starts the lookup; the UI shows it when it arrives
+                self.ui.repaint();
+            }
+            if let Some(r) = fail {
+                fails.push((id, pid, r, true));
             }
         }
 
@@ -113,7 +204,7 @@ impl Engine {
             {
                 let mut t = self.tr();
                 match t.get_mut(&id) {
-                    Some(e) if !e.user_killed => {
+                    Some(e) if !e.user_killed && e.pid == Some(pid) => {
                         e.state = State::Reconnecting; // stop the next tick re-reporting it
                         e.pid = None;
                         e.log = None;
@@ -128,6 +219,7 @@ impl Engine {
                     if close {
                         crash_detect::graceful_close(pid);
                     }
+                    e.after_client_exit(id);
                     e.on_failure(id, reason);
                 })
                 .ok();

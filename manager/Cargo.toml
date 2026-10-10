@@ -1,6 +1,6 @@
 [package]
 name = "roblox_account_manager"
-version = "1.3.0"
+version = "1.7.0"
 edition = "2021"
 
 # IMPORTANT: do not add tao, wry, webview2-com or anything that pulls them in.

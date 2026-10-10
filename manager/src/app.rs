@@ -55,6 +55,8 @@ pub struct EditBufs {
     pub place_input: String,
     pub place_msg: Option<(bool, String)>,
     pub show_preset: bool,
+    /// Game-name search waits until you stop typing (no request per keystroke).
+    pub search_due: Option<Instant>,
 }
 
 pub struct App {
@@ -89,6 +91,8 @@ pub struct App {
     /// Settings tab (index into ui::settings_view::TABS) and the profile card that's open for editing.
     pub settings_tab: usize,
     pub open_profile: Option<i64>,
+    /// Play was pressed for accounts without a game: confirm before opening the home screen.
+    pub confirm_play: Option<Vec<i64>>,
 }
 
 impl App {
@@ -119,6 +123,7 @@ impl App {
         });
         engine.adopt_running();
         watcher::detect::spawn(engine.clone());
+        engine.auto_start();
         spawn_startup_update_check(engine.clone());
         let mut app = App {
             engine,
@@ -149,6 +154,7 @@ impl App {
             update_dismissed: None,
             settings_tab: 0,
             open_profile: None,
+            confirm_play: None,
         };
         // Debug builds only: RAM_DEV_TAB=<n> opens Settings on tab n (for screenshots in testing).
         #[cfg(debug_assertions)]
@@ -250,6 +256,10 @@ impl eframe::App for App {
         let (focused, minimized) = ctx.input(|i| (i.viewport().focused.unwrap_or(true), i.viewport().minimized.unwrap_or(false)));
         let light = self.engine.settings.read().unwrap().manager_light;
         self.self_mode.update(&self.engine.ui, light, focused, minimized);
+        // Play times ("1h 05m") tick once a minute, only while the window is visible and something runs.
+        if !minimized && self.accounts.iter().any(|a| a.status == "live") {
+            ctx.request_repaint_after(Duration::from_secs(30));
+        }
         // Only refreshed when we're repainting anyway (input or a ping) — never schedules a repaint.
         if self.mem_at.elapsed() > Duration::from_secs(2) {
             self.mem = mem::current();

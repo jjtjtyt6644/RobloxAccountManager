@@ -2,7 +2,6 @@ use super::crash_detect;
 use super::State;
 use crate::launcher::Engine;
 use std::time::Duration;
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 impl Engine {
     /// Retry state machine: attempts++ -> over max => crashed, else wait delay and re-run full launch.
@@ -51,15 +50,19 @@ impl Engine {
                 None => None,
             }
         };
+        self.set_status(id, "stopping");
         let e = self.clone();
         std::thread::Builder::new()
             .name(format!("stop-{id}"))
             .spawn(move || {
-                if let Some(pid) = pid {
-                    crash_detect::graceful_close(pid);
-                }
+                let ended = pid.map_or(true, crash_detect::graceful_close);
                 e.clear(id, "idle");
-                e.log(id, "kill", "stopped by user");
+                e.after_client_exit(id);
+                if ended {
+                    e.log(id, "kill", "stopped by user — Roblox and its helper processes have ended");
+                } else {
+                    e.log(id, "kill_failed", "Windows wouldn't end this Roblox window; close it from Task Manager");
+                }
             })
             .ok();
     }
@@ -86,17 +89,15 @@ impl Engine {
     }
 
     pub fn kill_all_blocking(&self) {
-        let pids: Vec<sysinfo::Pid> = {
+        let pids: Vec<u32> = {
             let mut t = self.tr();
             t.values_mut().for_each(|e| e.user_killed = true);
-            t.values().filter_map(|t| t.pid).map(sysinfo::Pid::from_u32).collect()
+            t.values().filter_map(|t| t.pid).collect()
         };
-        let mut s = System::new();
-        s.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true, ProcessRefreshKind::new());
-        for p in pids {
-            if let Some(pr) = s.process(p) {
-                pr.kill();
-            }
+        // In parallel: closing the app shouldn't take 4 s per window.
+        let hs: Vec<_> = pids.into_iter().map(|p| std::thread::spawn(move || crash_detect::graceful_close(p))).collect();
+        for h in hs {
+            let _ = h.join();
         }
     }
 }

@@ -12,11 +12,14 @@ Sign in once, give each account a game, press Play. The manager keeps every wind
 ### 🎮 Play many accounts at once
 - **One click per account, or launch a whole group.** Tick several accounts and press Launch; they open one after another, each into its own game.
 - **No more "opening a second Roblox closes the first".** The manager handles Roblox's one-window limit for you, and tells you how to fix it if a Roblox window was already open before it started.
-- **Paste a game link or a Place ID.** Any `roblox.com/games/…` link works.
+- **Find a game by name.** Type "Adopt Me" and pick it from the list, or paste any `roblox.com/games/…` link or Place ID. No game set? Play opens Roblox on its home screen (after a quick warning).
 - **Groups, nicknames and search** to keep a long list of alts tidy.
+- **See what everyone's doing.** Each running account shows the game it's in and for how long, e.g. *Playing Adopt Me! · 1h 05m*. *Show window* jumps to it, and every Roblox window is titled with its account name.
+- **Open on start.** Mark the accounts you always run and they open by themselves when the manager starts.
+- **Clean stops.** Stop ends Roblox and its helper processes completely, so nothing is left using memory.
 
 ### 🔁 Stays running without you
-- **Auto-reconnect.** If a window crashes, shows an error pop-up, or hits the in-game *Disconnected* screen, it's reopened automatically. You choose how many tries and how long to wait between them.
+- **Auto-reconnect.** If a window crashes, shows an error pop-up, loses connection, gets kicked, the server shuts down, it freezes, or it never makes it into the game, it's reopened automatically. Roblox's own reason is shown in the Activity log, and you choose how many tries and how long to wait between them.
 - **Rejoin the same server (best-effort).** Once verified, a reconnect can aim for the server you were in.
 - **Finds Roblox windows it didn't open.** Opened Roblox from the website or before starting the manager? It recognises which of your accounts each window belongs to and starts looking after it. You don't need to close and reopen anything.
 - **Survives its own restarts.** Close the manager or let it update; your games keep running and are picked up again when it reopens.
@@ -25,7 +28,8 @@ Sign in once, give each account a game, press Play. The manager keeps every wind
 - **Memory saver.** Trims the RAM of the Roblox windows you aren't playing in, down to a target you choose (around 100 MB per window is realistic for alts on a light profile). Levels go from *Balanced* to a *Max* hard limit.
 - **CPU saver.** Puts background windows into Windows *Efficiency mode* at lower priority, or limits them to 2 CPU cores.
 - **The window you're playing in gets full speed back within a second** of clicking into it. You can also choose to apply the savers to every window.
-- **Performance profiles.** Give your main a nice-looking profile and your alts a light one (lower frame rate, lower textures, no shadows) so they need a fraction of the CPU, GPU and memory.
+- **Performance profiles.** Give your main a nice-looking profile and your alts a light one (frame-rate cap, low graphics quality, low textures, no anti-aliasing or grass, muted) so they need a fraction of the CPU, GPU and memory. Profiles use the settings Roblox actually accepts, and your own Roblox settings are left as they were.
+- **One window per account.** A second window for an account that's already playing is closed straight away, so the one you had keeps going.
 - **The manager itself barely registers.** When minimized it stops drawing completely (0% GPU) and drops to a few MB of RAM.
 
 ![Performance profiles](docs/screenshots/settings-performance.png)

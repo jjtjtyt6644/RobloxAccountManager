@@ -17,16 +17,27 @@ use zeroize::Zeroizing;
 pub const TABS: [&str; 5] = ["Games", "Performance", "Updates", "This app", "Security"];
 
 const PRIORITY: [&str; 3] = ["Normal", "Lower", "Lowest"];
-/// skip_mips 0..=4 as words. Values above 4 (set under Advanced) show as "Lowest".
-const TEXTURES: [&str; 5] = ["Full", "Half", "Quarter", "Low", "Lowest"];
+const TEXTURES: [&str; 4] = ["Full", "High", "Medium", "Lowest"];
 
-/// One line describing a profile, e.g. "60 fps · full textures · shadows · effects · normal priority".
+/// One line describing a profile, e.g. "30 fps · quality 3 · medium textures · no AA · muted · lower priority".
 pub fn preset_summary(p: &Preset) -> String {
     let g = &p.gfx;
-    let tex = TEXTURES[(g.skip_mips as usize).min(4)].to_lowercase();
-    let mut parts = vec![format!("{} fps", g.fps), format!("{tex} textures")];
-    parts.push(if g.shadows_off { "no shadows" } else { "shadows" }.into());
-    parts.push(if g.post_fx_off { "no effects" } else { "effects" }.into());
+    let mut parts = vec![match g.fps {
+        0 => "own frame rate".to_string(),
+        f if f >= 240 => "uncapped fps".to_string(),
+        f => format!("{f} fps"),
+    }];
+    parts.push(if g.graphics_quality == 0 { "own quality".into() } else { format!("quality {}", g.graphics_quality) });
+    parts.push(format!("{} textures", TEXTURES[(g.skip_mips as usize).min(3)].to_lowercase()));
+    if g.msaa_off {
+        parts.push("no AA".into());
+    }
+    if g.grass_off {
+        parts.push("no grass".into());
+    }
+    if g.mute {
+        parts.push("muted".into());
+    }
     parts.push(format!("{} priority", PRIORITY[p.priority.clamp(0, 2) as usize].to_lowercase()));
     parts.join("  ·  ")
 }
@@ -41,37 +52,46 @@ fn field(ui: &mut egui::Ui, label: &str, hint: &str, add: impl FnOnce(&mut egui:
 }
 
 /// The settings a profile controls (everything but its name). Used here and on the account page.
+/// Every one of these is something Roblox currently accepts (its own settings, or allow-listed flags).
 pub fn profile_fields(ui: &mut egui::Ui, p: &mut Preset) -> bool {
     let mut c = false;
     let g = &mut p.gfx;
-    field(ui, "Frame rate", "Lower = much less CPU and GPU. 10–15 is plenty for an AFK alt.", |ui| {
+    field(ui, "Frame-rate cap", "Lower = much less CPU and GPU. 15–30 is plenty for an AFK alt.", |ui| {
         ui.horizontal_wrapped(|ui| {
-            c |= ui.add(egui::Slider::new(&mut g.fps, 5..=240).suffix(" fps")).changed();
-            for v in [10u32, 15, 30, 60, 144] {
-                if ui.selectable_label(g.fps == v, v.to_string()).clicked() {
+            c |= ui
+                .add(egui::Slider::new(&mut g.fps, 0..=240).custom_formatter(|v, _| match v as u32 {
+                    0 => "don't change".into(),
+                    240.. => "uncapped".into(),
+                    f => format!("{f} fps"),
+                }))
+                .changed();
+            for (v, l) in [(0u32, "Don't change"), (15, "15"), (30, "30"), (60, "60"), (144, "144"), (240, "Uncapped")] {
+                if ui.selectable_label(g.fps == v, l).clicked() {
                     g.fps = v;
                     c = true;
                 }
             }
         });
     });
+    field(ui, "Graphics quality", "Roblox's own 1–10 quality setting. Low quality removes shadows, effects and detail.", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            c |= ui
+                .add(egui::Slider::new(&mut g.graphics_quality, 0..=10).custom_formatter(|v, _| {
+                    if v < 0.5 { "don't change".into() } else { format!("{v:.0}") }
+                }))
+                .changed();
+        });
+    });
     field(ui, "Texture quality", "Lower = less video memory.", |ui| {
-        if let Some(i) = segmented(ui, &TEXTURES, (g.skip_mips as usize).min(4)) {
+        if let Some(i) = segmented(ui, &TEXTURES, (g.skip_mips as usize).min(3)) {
             g.skip_mips = i as u32;
             c = true;
         }
     });
     field(ui, "Extras", "", |ui| {
-        let mut shadows = !g.shadows_off;
-        if ui.checkbox(&mut shadows, "Shadows").changed() {
-            g.shadows_off = !shadows;
-            c = true;
-        }
-        let mut fx = !g.post_fx_off;
-        if ui.checkbox(&mut fx, "Visual effects (bloom, blur, colour grading)").changed() {
-            g.post_fx_off = !fx;
-            c = true;
-        }
+        c |= ui.checkbox(&mut g.msaa_off, "Turn off anti-aliasing (smoother edges cost GPU)").changed();
+        c |= ui.checkbox(&mut g.grass_off, "Turn off grass").changed();
+        c |= ui.checkbox(&mut g.mute, "Mute sound").changed();
     });
     field(ui, "Priority", "How much CPU time Windows gives it compared with your other programs.", |ui| {
         if let Some(i) = segmented(ui, &PRIORITY, p.priority.clamp(0, 2) as usize) {
@@ -79,25 +99,11 @@ pub fn profile_fields(ui: &mut egui::Ui, p: &mut Preset) -> bool {
             c = true;
         }
     });
-    let g = &mut p.gfx;
-    ui.add_space(4.0);
-    egui::CollapsingHeader::new(RichText::new("Advanced").color(WEAK)).id_salt(("adv", p.id)).show(ui, |ui| {
-        egui::Grid::new(("adv-grid", p.id)).num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-            ui.label("Exact texture level");
-            c |= ui
-                .add(egui::Slider::new(&mut g.skip_mips, 0..=8).custom_formatter(|v, _| {
-                    if v < 0.5 { "full".into() } else { format!("1/{}", 1u32 << (v as u32)) }
-                }))
-                .changed();
-            ui.end_row();
-            ui.label("Frame buffer cap");
-            c |= ui
-                .add(egui::Slider::new(&mut g.fb_cap, 0..=1024).custom_formatter(|v, _| if v < 0.5 { "not set".into() } else { format!("{v:.0}") }))
-                .changed();
-            ui.end_row();
-        });
-        help(ui, "Roblox only honours an allow-list of these settings; anything it doesn't allow is ignored silently.");
-    });
+    help(
+        ui,
+        "Applied when the account launches. Frame rate, quality and volume use Roblox's own settings and are put back \
+         to yours afterwards, so your own Roblox keeps your settings.",
+    );
     c
 }
 
@@ -220,10 +226,21 @@ fn games(app: &mut App, ui: &mut egui::Ui, s: &mut Settings, changed: &mut bool)
                 app.engine.close_all_roblox_and_fix();
             }
         }
+        *changed |= ui
+            .checkbox(&mut s.one_window_per_account, "Only one window per account (recommended)")
+            .on_hover_text(
+                "If a second Roblox window opens for an account that's already playing, it's closed straight away \
+                 and the first one keeps going. Without this, Roblox kicks one of them (Error 273).",
+            )
+            .changed();
         *changed |= ui.checkbox(&mut s.kill_on_exit, "Close all Roblox windows when I close the manager").changed();
+        *changed |= ui
+            .checkbox(&mut s.title_windows, "Name each Roblox window after its account (e.g. \"Roblox — Main\")")
+            .on_hover_text("Makes it easy to tell windows apart on the taskbar and in Alt+Tab.")
+            .changed();
     });
 
-    section(ui, "When a window crashes or disconnects", "Covers crashes, error pop-ups and the in-game \"Disconnected\" screen.", None, |ui| {
+    section(ui, "When a window crashes or disconnects", "Covers crashes, error pop-ups, the in-game \"Disconnected\" screen, kicks and frozen windows.", None, |ui| {
         *changed |= ui.checkbox(&mut s.auto_reconnect, "Reopen it automatically").changed();
         ui.add_enabled_ui(s.auto_reconnect, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -240,9 +257,19 @@ fn games(app: &mut App, ui: &mut egui::Ui, s: &mut Settings, changed: &mut bool)
             });
         });
         *changed |= ui
-            .checkbox(&mut s.log_tail, "Spot the in-game \"Disconnected\" screen (recommended)")
-            .on_hover_text("That screen is drawn inside the game, not as a separate window, so the manager reads Roblox's log file to notice it.")
+            .checkbox(&mut s.detect_disconnects, "Notice disconnects, kicks and frozen windows (recommended)")
+            .on_hover_text(
+                "Lost connection, kicked, server shut down, same account joined elsewhere, a window that stops responding, \
+                 or one that never gets into the game. Most of these are drawn inside the game, so the manager reads \
+                 Roblox's own log for each window.",
+            )
             .changed();
+        ui.add_enabled_ui(s.detect_disconnects, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(26.0);
+                *changed |= ui.checkbox(&mut s.reopen_if_left, "Also reopen it if it leaves the game to the Roblox home screen").changed();
+            });
+        });
         *changed |= ui
             .checkbox(&mut s.retry_on_auth_fail, "Keep trying if Roblox's servers refuse the launch")
             .on_hover_text("Doesn't apply to expired sign-ins; those always need signing in again.")
@@ -323,6 +350,26 @@ fn performance(app: &mut App, ui: &mut egui::Ui, s: &mut Settings, changed: &mut
                 *changed |= ui.add(egui::Slider::new(&mut s.trim_target_mb, 60..=1000).suffix(" MB").logarithmic(true)).changed();
             });
             help(ui, "100 MB is reachable on a light profile. Heavier games bounce back between checks unless you use Max.");
+            let t = s.trim_target_mb;
+            if s.trim_mode == TrimMode::Max && t < 200 {
+                warn(
+                    ui,
+                    true,
+                    &format!(
+                        "Max with a {t} MB limit is very tight: Roblox can freeze, crash or get disconnected when it can't \
+                         get the memory it needs. Use 200 MB or more with Max, or switch to Balanced."
+                    ),
+                );
+            } else if t < 100 {
+                warn(
+                    ui,
+                    false,
+                    &format!(
+                        "{t} MB is below what most games need, so windows will keep pulling memory back in and may \
+                         stutter. 100–200 MB is a safer target."
+                    ),
+                );
+            }
         });
         let live: Vec<u64> = app.engine.tr().values().filter(|e| e.pid.is_some()).map(|e| e.mem_ws).collect();
         if !live.is_empty() {
@@ -343,6 +390,31 @@ fn performance(app: &mut App, ui: &mut egui::Ui, s: &mut Settings, changed: &mut
         }
         let (_, name, _, body, cost) = CPU_LEVELS[idx];
         explain(ui, name, body, cost);
+        if s.cpu_saver == CpuMode::Strong {
+            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+            let windows = app.engine.tr().values().filter(|t| t.pid.is_some()).count() + app.engine.others.lock().unwrap().len();
+            if threads > 0 && threads <= 4 {
+                warn(
+                    ui,
+                    true,
+                    &format!(
+                        "This PC has only {threads} CPU threads. Squeezing windows onto 2 of them at the lowest priority \
+                         can make games lag badly or time out. Efficiency is a better fit here."
+                    ),
+                );
+            } else if windows > 4 {
+                warn(
+                    ui,
+                    false,
+                    &format!(
+                        "{windows} Roblox windows will share the same 2 CPU cores. Busy games may lag or load slowly; \
+                         use Efficiency if any of them need to keep up."
+                    ),
+                );
+            } else {
+                warn(ui, false, "Limited windows get only 2 CPU cores at the lowest priority. Fine for AFK alts; busy games may lag.");
+            }
+        }
     });
 
     section(ui, "Which windows the savers apply to", "Also covers Roblox windows the manager didn't open itself.", None, |ui| {
@@ -350,11 +422,31 @@ fn performance(app: &mut App, ui: &mut egui::Ui, s: &mut Settings, changed: &mut
         help(ui, "The window you click into gets full speed and memory back within a second.");
         *changed |= ui.radio_value(&mut s.saver_all_windows, true, "Every Roblox window, including the one I'm playing").changed();
         if s.saver_all_windows {
-            ui.label(
-                RichText::new("The game you're playing will also be trimmed and slowed — expect hitches, especially with Max or Strong.")
-                    .color(AMBER)
-                    .size(12.5),
-            );
+            let severe = s.trim_mode == TrimMode::Max || s.cpu_saver == CpuMode::Strong;
+            let mut parts = vec![];
+            if s.trim_mode == TrimMode::Max {
+                parts.push(format!("held to {} MB", s.trim_target_mb));
+            } else if s.trim_mode != TrimMode::Off {
+                parts.push("trimmed".to_string());
+            }
+            match s.cpu_saver {
+                CpuMode::Strong => parts.push("limited to 2 CPU cores at the lowest priority".into()),
+                CpuMode::Efficiency => parts.push("slowed by Efficiency mode".into()),
+                CpuMode::Off => {}
+            }
+            if parts.is_empty() {
+                help(ui, "Both savers are off, so this has no effect yet.");
+            } else {
+                warn(
+                    ui,
+                    severe,
+                    &format!(
+                        "The game you're playing will also be {}. {}",
+                        parts.join(" and "),
+                        if severe { "Expect heavy lag or freezing while you play." } else { "Expect occasional hitches." }
+                    ),
+                );
+            }
         }
     });
 }

@@ -109,7 +109,7 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
         let sel: Vec<&Account> = app.accounts.iter().filter(|a| app.checked.contains(&a.id)).collect();
         let launchable: Vec<i64> = sel
             .iter()
-            .filter(|a| !is_running(&a.status) && !a.place_id.is_empty() && a.status != "needs_relogin")
+            .filter(|a| !is_running(&a.status) && a.status != "needs_relogin")
             .map(|a| a.id)
             .collect();
         let stoppable: Vec<i64> = sel.iter().filter(|a| is_running(&a.status)).map(|a| a.id).collect();
@@ -122,10 +122,10 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
                 if ui
                     .add_enabled(!launchable.is_empty(), primary(&format!("▶  Launch {}", launchable.len())))
                     .on_hover_text("Clients start one after another; each waits for the previous one's window.")
-                    .on_disabled_hover_text("All selected accounts are running, have no game set, or need to sign in again.")
+                    .on_disabled_hover_text("All selected accounts are running or need to sign in again.")
                     .clicked()
                 {
-                    app.engine.launch_many(launchable.clone());
+                    request_play(app, launchable.clone());
                 }
                 if ui.add_enabled(!stoppable.is_empty(), subtle(&format!("⏹  Stop {}", stoppable.len()))).clicked() {
                     app.engine.kill_many(stoppable.clone());
@@ -135,7 +135,7 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
                 }
             });
             if no_game > 0 {
-                ui.label(RichText::new(format!("{no_game} selected without a game will be skipped.")).color(AMBER).size(12.0));
+                ui.label(RichText::new(format!("{no_game} selected without a game will open on the Roblox home screen.")).color(AMBER).size(12.0));
             }
         });
     }
@@ -159,13 +159,7 @@ fn row(app: &mut App, ui: &mut egui::Ui, a: &Account) {
     let running = is_running(&a.status);
     let selected = app.selected == Some(a.id);
     let ram = app.engine.tr().get(&a.id).filter(|t| t.pid.is_some() && t.mem_ws > 0).map(|t| (t.mem_ws, t.mem_note));
-    let why = if a.place_id.is_empty() {
-        Some("Set a game for this account first")
-    } else if a.status == "needs_relogin" {
-        Some("Sign in again first (+ Add account)")
-    } else {
-        None
-    };
+    let why = (a.status == "needs_relogin").then_some("Sign in again first (+ Add account)");
 
     // The whole row is one clickable card (click = select, double-click = Play). Widgets placed on top
     // of it (checkbox, button) take their own clicks.
@@ -182,7 +176,7 @@ fn row(app: &mut App, ui: &mut egui::Ui, a: &Account) {
         app.selected = Some(a.id);
     }
     if bg.double_clicked() && !running && why.is_none() {
-        app.engine.launch(a.id);
+        request_play(app, vec![a.id]);
     }
 
     let mut ui = ui.new_child(
@@ -203,7 +197,9 @@ fn row(app: &mut App, ui: &mut egui::Ui, a: &Account) {
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         let narrow = ui.available_width() < 220.0;
         let size = egui::vec2(if narrow { 36.0 } else { 72.0 }, 32.0);
-        if running {
+        if a.status == "stopping" {
+            ui.add_enabled(false, subtle(if narrow { "…" } else { "Stopping" }).min_size(size));
+        } else if running {
             if ui.add(subtle(if narrow { "⏹" } else { "⏹ Stop" }).min_size(size)).on_hover_text("Stop").clicked() {
                 app.engine.kill(a.id);
             }
@@ -213,7 +209,7 @@ fn row(app: &mut App, ui: &mut egui::Ui, a: &Account) {
             .on_disabled_hover_text(why.unwrap_or(""))
             .clicked()
         {
-            app.engine.launch(a.id);
+            request_play(app, vec![a.id]);
         }
         if let Some((ws, note)) = ram.filter(|_| ui.available_width() > 180.0) {
             let c = if note == MemNote::Focused || ws > 400 * 1024 * 1024 { WEAK } else { GREEN };
@@ -233,12 +229,24 @@ fn row(app: &mut App, ui: &mut egui::Ui, a: &Account) {
             ui.add(one_line(a.label.clone(), 14.5, if selected { egui::Color32::WHITE } else { TEXT }));
             let mut job = LayoutJob::default();
             job.wrap = egui::text::TextWrapping::truncate_at_width(w);
-            let mut sub = format!("@{}", a.username);
-            if !a.group_tag.is_empty() {
-                sub.push_str(&format!("  ·  {}", a.group_tag));
+            let small = |c| TextFormat { font_id: FontId::proportional(12.0), color: c, ..Default::default() };
+            let since = app.engine.tr().get(&a.id).filter(|t| t.pid.is_some()).map(|t| t.live_since_ts);
+            match (a.status == "live", since) {
+                (true, Some(since)) => {
+                    // "Playing Adopt Me! · 1h 05m"
+                    let what = app.engine.now_playing(a.id).map_or("In Roblox".to_string(), |g| format!("Playing {g}"));
+                    job.append(&what, 0.0, small(GREEN));
+                    job.append(&format!("  ·  {}", uptime(since)), 0.0, small(WEAK));
+                }
+                _ => {
+                    let mut sub = format!("@{}", a.username);
+                    if !a.group_tag.is_empty() {
+                        sub.push_str(&format!("  ·  {}", a.group_tag));
+                    }
+                    job.append(&sub, 0.0, small(WEAK));
+                    job.append(&format!("  ·  {text}"), 0.0, small(color));
+                }
             }
-            job.append(&sub, 0.0, TextFormat { font_id: FontId::proportional(12.0), color: WEAK, ..Default::default() });
-            job.append(&format!("  ·  {text}"), 0.0, TextFormat { font_id: FontId::proportional(12.0), color, ..Default::default() });
             ui.add(egui::Label::new(job).selectable(false));
         });
     });
@@ -292,6 +300,7 @@ fn load_bufs(app: &mut App, acc: &Account) {
     app.edit.group = acc.group_tag.clone();
     app.edit.place_input = acc.place_id.clone();
     app.edit.place_msg = None;
+    app.edit.search_due = None;
     app.edit.show_preset = false;
     app.confirm_remove = None;
 }
@@ -346,12 +355,23 @@ fn header(app: &mut App, ui: &mut egui::Ui, acc: &Account) {
     };
     // Narrow windows: stack the button under the name instead of squeezing it off the edge.
     let narrow = ui.available_width() < 520.0;
+    let playing = app.engine.now_playing(acc.id);
+    let since = app.engine.tr().get(&acc.id).filter(|t| t.pid.is_some()).map(|t| t.live_since_ts);
     let title = |ui: &mut egui::Ui| {
         ui.label(RichText::new(&acc.label).size(26.0).strong());
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(format!("@{}", acc.username)).color(WEAK));
             pill(ui, &text, color);
         });
+        if acc.status == "live" {
+            if let Some(since) = since {
+                ui.horizontal_wrapped(|ui| {
+                    let g = playing.clone().unwrap_or_else(|| "Roblox".into());
+                    ui.label(RichText::new(format!("Playing {g}")).size(16.0).strong().color(GREEN));
+                    ui.label(RichText::new(format!("for {}", uptime(since))).color(WEAK));
+                });
+            }
+        }
     };
     if narrow {
         title(ui);
@@ -370,61 +390,194 @@ fn header(app: &mut App, ui: &mut egui::Ui, acc: &Account) {
 
 fn play_stop_big(app: &mut App, ui: &mut egui::Ui, acc: &Account, width: f32) {
     let size = egui::vec2(width, 42.0);
-    if is_running(&acc.status) {
-        if ui.add(danger("⏹  Stop").min_size(size)).clicked() {
-            app.engine.kill(acc.id);
-        }
+    if acc.status == "stopping" {
+        ui.add_enabled(false, subtle("Stopping…").min_size(size));
+    } else if is_running(&acc.status) {
+        ui.vertical(|ui| {
+            if ui.add(danger("⏹  Stop").min_size(size)).on_hover_text("Closes Roblox and ends all of its processes").clicked() {
+                app.engine.kill(acc.id);
+            }
+            if acc.status == "live"
+                && ui.add(subtle("Show window").min_size(egui::vec2(width, 30.0))).on_hover_text("Bring this account's Roblox window to the front").clicked()
+            {
+                app.engine.show_window(acc.id);
+            }
+        });
     } else {
-        let why = if acc.place_id.is_empty() {
-            Some("Add a game below first")
-        } else if acc.status == "needs_relogin" {
-            Some("Sign in again first")
-        } else {
-            None
-        };
+        let why = (acc.status == "needs_relogin").then_some("Sign in again first");
         let r = ui.add_enabled(why.is_none(), primary("▶  Play").min_size(size));
         if r.on_disabled_hover_text(why.unwrap_or("")).clicked() {
-            app.engine.launch(acc.id);
+            request_play(app, vec![acc.id]);
         }
     }
 }
 
 fn game_card(app: &mut App, ui: &mut egui::Ui, acc: &Account) {
     card(ui, "Game", |ui| {
-        help(ui, "Paste a roblox.com game link or a Place ID. Play joins this game.");
+        help(ui, "Type a game's name to search, or paste a roblox.com game link or a Place ID.");
+        if !acc.place_id.is_empty() {
+            let what = if acc.place_name.is_empty() {
+                format!("Place {}", acc.place_id)
+            } else {
+                format!("{}  ·  Place {}", acc.place_name, acc.place_id)
+            };
+            ui.label(RichText::new(format!("Plays: {what}")).color(GREEN).size(13.0));
+        }
         let r = ui.add(
             egui::TextEdit::singleline(&mut app.edit.place_input)
-                .hint_text("https://www.roblox.com/games/920587237/…   or   920587237")
+                .hint_text("e.g. Adopt Me   ·   roblox.com/games/920587237/…   ·   920587237")
                 .desired_width(f32::INFINITY),
         );
+        let typed = app.edit.place_input.trim().to_string();
         if r.changed() {
-            if app.edit.place_input.trim().is_empty() {
+            app.edit.search_due = None;
+            if typed.is_empty() {
                 let _ = app.db.set_place(acc.id, "");
                 app.edit.place_msg = None;
                 app.reload();
-            } else {
-                match parse_place(&app.edit.place_input) {
-                    Ok(p) => {
-                        if p != acc.place_id {
-                            let _ = app.db.set_place(acc.id, &p);
-                            app.reload();
-                        }
-                        app.edit.place_msg = Some((true, format!("✔  Saved — Place {p}")));
-                    }
-                    Err(m) => app.edit.place_msg = Some((false, m.to_string())),
+            } else if let Ok(p) = parse_place(&typed) {
+                if p != acc.place_id {
+                    let _ = app.db.set_place(acc.id, &p);
+                    app.reload();
                 }
+                app.edit.place_msg = Some((true, format!("✔  Saved — Place {p}")));
+            } else if typed.to_ascii_lowercase().contains("roblox.com") {
+                app.edit.place_msg = Some((false, "That link doesn't contain a Place ID — open the game's page and copy its link.".into()));
+            } else if typed.chars().count() >= 2 {
+                // A name: search once you stop typing.
+                app.edit.place_msg = None;
+                app.edit.search_due = Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
             }
         }
+        if let Some(due) = app.edit.search_due {
+            let now = std::time::Instant::now();
+            if now >= due {
+                app.edit.search_due = None;
+                app.engine.search_games(typed.clone());
+            } else {
+                ui.ctx().request_repaint_after(due - now); // one wake-up, only while a search is pending
+            }
+        }
+
+        // Results for exactly what's in the box (never stale ones).
+        let st = app.engine.search.lock().unwrap().clone();
+        if st.query == typed && parse_place(&typed).is_err() && !typed.is_empty() {
+            if st.busy || app.edit.search_due.is_some() {
+                help(ui, &format!("Searching Roblox for \u{201c}{typed}\u{201d}…"));
+            } else if let Some(er) = &st.error {
+                ui.label(RichText::new(er).color(AMBER).size(12.5));
+            } else if !st.results.is_empty() {
+                ui.add_space(2.0);
+                help(ui, "Pick the game:");
+                for hit in &st.results {
+                    let text = format!("{}    ·    {} playing", hit.name, thousands(hit.players));
+                    let picked = ui
+                        .add(egui::Button::new(RichText::new(text)).frame(true).min_size(egui::vec2(ui.available_width(), 32.0)))
+                        .on_hover_text(format!("Place {}", hit.place_id))
+                        .clicked();
+                    if picked {
+                        let _ = app.db.set_place_named(acc.id, &hit.place_id, &hit.name);
+                        app.edit.place_input = hit.place_id.clone();
+                        app.edit.place_msg = Some((true, format!("✔  Saved — {} (Place {})", hit.name, hit.place_id)));
+                        app.engine.search.lock().unwrap().query.clear();
+                        app.reload();
+                    }
+                }
+            }
+        } else if app.edit.search_due.is_some() {
+            help(ui, &format!("Searching Roblox for \u{201c}{typed}\u{201d}…"));
+        }
+
         match &app.edit.place_msg {
             Some((ok, m)) => {
                 ui.label(RichText::new(m).color(if *ok { GREEN } else { AMBER }).size(12.5));
             }
-            None if acc.place_id.is_empty() => {
-                ui.label(RichText::new("No game set yet — Play stays disabled until you add one.").color(AMBER).size(12.5));
+            None if acc.place_id.is_empty() && typed.is_empty() => {
+                ui.label(
+                    RichText::new("No game set — Play opens Roblox on its home screen, where you can pick a game.")
+                        .color(AMBER)
+                        .size(12.5),
+                );
             }
             None => {}
         }
     });
+}
+
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Play for these accounts — straight away if they all have a game, else ask first.
+pub fn request_play(app: &mut App, ids: Vec<i64>) {
+    let any_without = ids.iter().any(|id| app.accounts.iter().any(|a| a.id == *id && a.place_id.is_empty()));
+    if any_without {
+        app.confirm_play = Some(ids);
+    } else {
+        app.engine.launch_many(ids);
+    }
+}
+
+/// "No game set" confirmation shown when Play is pressed for accounts without a game.
+pub fn no_game_dialog(app: &mut App, ctx: &egui::Context) {
+    let Some(ids) = app.confirm_play.clone() else { return };
+    let without: Vec<Account> = app.accounts.iter().filter(|a| ids.contains(&a.id) && a.place_id.is_empty()).cloned().collect();
+    if without.is_empty() {
+        app.confirm_play = None;
+        app.engine.launch_many(ids);
+        return;
+    }
+    let screen = ctx.screen_rect();
+    egui::Area::new(egui::Id::new("nogame-dim")).order(egui::Order::Middle).fixed_pos(screen.min).show(ctx, |ui| {
+        let (r, _) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+        ui.painter().rect_filled(r, egui::Rounding::ZERO, egui::Color32::from_black_alpha(140));
+    });
+    let width = (screen.width() - 48.0).clamp(280.0, 440.0);
+    egui::Window::new("no-game")
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .default_width(width)
+        .frame(egui::Frame::none().fill(CARD).stroke(egui::Stroke::new(1.0, BORDER)).rounding(14.0).inner_margin(Margin::same(22.0)))
+        .show(ctx, |ui| {
+            ui.set_width(width);
+            ui.label(RichText::new("⚠  No game set").size(19.0).strong().color(AMBER));
+            ui.add_space(4.0);
+            let names: Vec<&str> = without.iter().take(4).map(|a| a.label.as_str()).collect();
+            let more = if without.len() > 4 { format!(" and {} more", without.len() - 4) } else { String::new() };
+            ui.label(format!(
+                "{}{more} {} no game. Roblox will open on its home screen and you can pick a game there.",
+                names.join(", "),
+                if without.len() == 1 { "has" } else { "have" }
+            ));
+            ui.add_space(2.0);
+            help(ui, "If it disconnects later, the manager reopens the last game it saw that window join.");
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.add(primary("Play anyway").min_size(egui::vec2(130.0, 38.0))).clicked() {
+                    app.confirm_play = None;
+                    app.engine.launch_many(ids.clone());
+                }
+                if without.len() == 1 && ui.add(subtle("Set a game").min_size(egui::vec2(110.0, 38.0))).clicked() {
+                    app.confirm_play = None;
+                    app.nav = Nav::Accounts;
+                    app.selected = Some(without[0].id);
+                }
+                if ui.add(subtle("Cancel").min_size(egui::vec2(90.0, 38.0))).clicked() {
+                    app.confirm_play = None;
+                }
+            });
+        });
 }
 
 fn setup_card(app: &mut App, ui: &mut egui::Ui, acc: &Account) {
@@ -462,6 +615,17 @@ fn setup_card(app: &mut App, ui: &mut egui::Ui, acc: &Account) {
                         }
                     }
                 });
+            }
+        });
+        form_row(ui, "Open on start", |ui| {
+            let mut on = acc.auto_start;
+            if ui
+                .checkbox(&mut on, "Open this account when the manager starts")
+                .on_hover_text("Handy for alts you always run. Accounts that are already running are left alone.")
+                .changed()
+            {
+                app.db.set_auto_start(acc.id, on);
+                app.reload();
             }
         });
         form_row(ui, "Performance profile", |ui| {
@@ -513,6 +677,11 @@ fn session_card(app: &mut App, ui: &mut egui::Ui, acc: &Account) {
                     ui.label(RichText::new("Process").color(WEAK));
                     ui.label(pid.map(|p| format!("PID {p}")).unwrap_or_else(|| "starting…".into()));
                     ui.end_row();
+                    if let Some(g) = app.engine.now_playing(acc.id) {
+                        ui.label(RichText::new("Playing").color(WEAK));
+                        ui.label(g);
+                        ui.end_row();
+                    }
                     if pid.is_some() && ws > 0 {
                         ui.label(RichText::new("Memory now").color(WEAK));
                         ui.horizontal(|ui| {

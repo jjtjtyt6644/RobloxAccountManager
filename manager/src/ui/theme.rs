@@ -54,9 +54,15 @@ pub fn apply(ctx: &egui::Context) {
         // Small radius so checkboxes stay square; buttons set their own larger radius (widgets.rs).
         w.rounding = Rounding::same(5.0);
     }
-    ctx.set_visuals(v);
+    // Always dark, whatever the Windows light/dark setting. egui follows the system theme by default
+    // and keeps a separate style per theme, so on a PC in light mode it used its light style (dark
+    // text, light buttons) on top of our dark panels — black-on-black text. Pin the theme to dark
+    // and give both theme slots the same visuals so nothing can switch underneath us.
+    ctx.set_theme(egui::ThemePreference::Dark);
+    ctx.set_visuals_of(egui::Theme::Light, v.clone());
+    ctx.set_visuals_of(egui::Theme::Dark, v);
 
-    ctx.style_mut(|s| {
+    ctx.all_styles_mut(|s| {
         s.animation_time = 0.0; // no animations => no extra repaints while idle
         s.spacing.item_spacing = egui::vec2(8.0, 8.0);
         s.spacing.button_padding = egui::vec2(14.0, 6.0);

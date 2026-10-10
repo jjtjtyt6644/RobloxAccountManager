@@ -16,6 +16,7 @@ use widgets::*;
 pub fn draw(app: &mut App, ctx: &egui::Context) {
     top_bar(app, ctx);
     status_bar(app, ctx);
+    accounts::no_game_dialog(app, ctx);
     update_dialog::show(app, ctx);
     match app.nav {
         Nav::Accounts => accounts::show(app, ctx),

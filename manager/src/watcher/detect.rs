@@ -13,7 +13,7 @@
 //!
 //! Cost: one process-name scan (no CPU/memory/disk queries) every 6 s, plus reading new log lines of
 //! the unidentified clients only. Logs are read incrementally, never whole files twice.
-use super::crash_detect::{logs_dir, LogTail};
+use super::crash_detect::{log_time, logs_dir, LogTail};
 use super::State;
 use crate::launcher::Engine;
 use std::collections::{HashMap, HashSet};
@@ -29,26 +29,6 @@ pub struct OtherClient {
     pub user_id: Option<u64>,
 }
 
-/// Unix seconds from a log name's "20261009T080341Z" part.
-fn log_time(name: &str) -> Option<u64> {
-    let i = name.find('_')? + 1;
-    let t = name.get(i..i + 16)?;
-    if t.as_bytes()[8] != b'T' || !t.ends_with('Z') {
-        return None;
-    }
-    let n = |a: usize, b: usize| t.get(a..b)?.parse::<i64>().ok();
-    let (y, mo, d, h, mi, s) = (n(0, 4)?, n(4, 6)?, n(6, 8)?, n(9, 11)?, n(11, 13)?, n(13, 15)?);
-    // Days from civil date (Howard Hinnant's algorithm).
-    let y2 = if mo <= 2 { y - 1 } else { y };
-    let era = y2.div_euclid(400);
-    let yoe = y2 - era * 400;
-    let mp = (mo + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    u64::try_from(days * 86400 + h * 3600 + mi * 60 + s).ok()
-}
-
 /// Last "userid:<digits>" in `text`.
 pub fn find_user_id(text: &str) -> Option<u64> {
     const KEY: &str = "userid:";
@@ -62,15 +42,19 @@ struct Seen {
     start: u64,
     log: Option<LogTail>,
     user_id: Option<u64>,
+    /// Game it's in (universe id), from the same log.
+    universe: Option<u64>,
 }
 
 impl Engine {
-    /// One detection pass. `seen` persists between passes.
-    fn detect_pass(&self, sys: &mut System, seen: &mut HashMap<u32, Seen>) {
+    /// One detection pass. `seen` persists between passes. Returns true while a new window hasn't been
+    /// identified yet (the caller then checks again within a fraction of a second, so a second window
+    /// of an open account is caught right as it joins, before it can get the first one kicked).
+    fn detect_pass(&self, sys: &mut System, seen: &mut HashMap<u32, Seen>) -> bool {
         // A launch in progress may be about to bind a brand-new client; let it, then look again.
         let busy = self.tr().values().any(|t| matches!(t.state, State::Starting | State::Reconnecting));
         if busy {
-            return;
+            return false;
         }
         sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::new());
         let tracked: HashSet<u32> = self.tr().values().filter_map(|t| t.pid).collect();
@@ -105,7 +89,7 @@ impl Engine {
             let mut order = roblox.clone();
             order.sort_by_key(|r| r.1);
             for (pid, st) in order {
-                let s = seen.entry(pid).or_insert(Seen { start: st, log: None, user_id: None });
+                let s = seen.entry(pid).or_insert(Seen { start: st, log: None, user_id: None, universe: None });
                 if s.log.is_none() {
                     // The log created closest to this process's start (it's written within ~1 s).
                     let best = logs
@@ -119,10 +103,17 @@ impl Engine {
                 }
                 if s.user_id.is_none() {
                     if let Some(l) = s.log.as_mut() {
-                        s.user_id = find_user_id(&l.read_new());
+                        let txt = l.read_new();
+                        s.user_id = find_user_id(&txt);
+                        s.universe = super::crash_detect::find_universe(&txt).or(s.universe);
                     }
                 }
             }
+        }
+
+        // One window per account: close the newer of two windows signed into the same account.
+        if self.settings.read().unwrap().one_window_per_account {
+            self.close_duplicates(seen);
         }
 
         // Identified clients of our accounts become tracked.
@@ -141,6 +132,10 @@ impl Engine {
                 LogTail::at(l.path, end)
             });
             self.track_existing(id, *pid, s.start, s.start, s.start as i64, prio, log);
+            if let Some(e) = self.tr().get_mut(&id) {
+                e.title = acc.label.clone();
+                e.universe = s.universe;
+            }
             self.log(id, "detected", &format!("found it already running (PID {pid}), started outside the manager — now watching it"));
             adopted.push(*pid);
         }
@@ -162,8 +157,79 @@ impl Engine {
             drop(cur);
             self.ui.ping();
         }
+        let now = crate::storage::db::now() as u64;
+        seen.values().any(|s| s.user_id.is_none() && s.log.is_some() && now.saturating_sub(s.start) < FAST_FOR)
+    }
+
+    /// For every account with two windows, end the NEWER one and keep the one that was there first.
+    /// Covers a tracked window + a newly opened one (either may be the newer), and two windows the
+    /// manager isn't tracking.
+    fn close_duplicates(&self, seen: &mut HashMap<u32, Seen>) {
+        // user id -> (start time, pid, Some(account id) if tracked)
+        let mut first: HashMap<u64, (u64, u32, Option<i64>)> = HashMap::new();
+        let tracked: Vec<(i64, u32, u64)> =
+            self.tr().iter().filter_map(|(id, t)| t.pid.filter(|_| t.state == State::Live).map(|p| (*id, p, t.start_time))).collect();
+        for (id, pid, st) in tracked {
+            if let Some(uid) = self.db.user_id_of(id) {
+                first.insert(uid, (st, pid, Some(id)));
+            }
+        }
+        let mut ids: Vec<(u32, u64, u64)> = seen.iter().filter_map(|(p, s)| s.user_id.map(|u| (*p, u, s.start))).collect();
+        ids.sort_by_key(|x| x.2);
+        for (pid, uid, st) in ids {
+            let Some(&(kept_st, kept_pid, kept_acc)) = first.get(&uid) else {
+                first.insert(uid, (st, pid, None));
+                continue;
+            };
+            let account = self.db.account_by_user_id(uid).unwrap_or(0);
+            if st >= kept_st {
+                // The usual case: a new window for an account that's already open. End it now.
+                crate::watcher::crash_detect::end_now(pid);
+                seen.remove(&pid);
+                self.log(
+                    account,
+                    "duplicate",
+                    &format!("closed a second Roblox window for this account (PID {pid}) — kept the one that was already open (PID {kept_pid})"),
+                );
+            } else if let Some(acc_id) = kept_acc {
+                // The tracked window is the newer one: switch tracking to the older window, then end the newer.
+                let s = seen.remove(&pid).unwrap();
+                let prio = self.tr().get(&acc_id).map_or(1, |t| t.base_priority);
+                let title = self.tr().get(&acc_id).map(|t| t.title.clone()).unwrap_or_default();
+                let log = s.log.map(|l| {
+                    let end = std::fs::metadata(&l.path).map(|m| m.len()).unwrap_or(0);
+                    LogTail::at(l.path, end)
+                });
+                self.track_existing(acc_id, pid, s.start, s.start, s.start as i64, prio, log);
+                if let Some(e) = self.tr().get_mut(&acc_id) {
+                    e.title = title;
+                    e.universe = s.universe;
+                }
+                crate::watcher::crash_detect::end_now(kept_pid);
+                self.log(
+                    acc_id,
+                    "duplicate",
+                    &format!("closed a second Roblox window for this account (PID {kept_pid}) — kept the one that was open first (PID {pid})"),
+                );
+                first.insert(uid, (st, pid, Some(acc_id)));
+            } else {
+                // Two untracked windows; this one is older: end the other.
+                crate::watcher::crash_detect::end_now(kept_pid);
+                seen.remove(&kept_pid);
+                self.log(
+                    account,
+                    "duplicate",
+                    &format!("closed a second Roblox window for the same account (PID {kept_pid}) — kept the one that was open first (PID {pid})"),
+                );
+                first.insert(uid, (st, pid, None));
+            }
+            self.ui.ping();
+        }
     }
 }
+
+/// How long after a window starts the detector keeps checking it several times a second.
+const FAST_FOR: u64 = 90;
 
 /// Fills in Roblox user ids for accounts added before 1.3.0 (public lookup by username).
 pub fn backfill_user_ids(engine: &Engine) {
@@ -194,8 +260,10 @@ pub fn spawn(engine: Engine) {
             let mut seen: HashMap<u32, Seen> = HashMap::new();
             std::thread::sleep(Duration::from_secs(2));
             loop {
-                engine.detect_pass(&mut sys, &mut seen);
-                std::thread::sleep(Duration::from_secs(6));
+                // Normally every 6 s; several times a second only while a just-opened window hasn't
+                // been identified (at most ~90 s per new window).
+                let fast = engine.detect_pass(&mut sys, &mut seen);
+                std::thread::sleep(if fast { Duration::from_millis(300) } else { Duration::from_secs(6) });
             }
         })
         .expect("spawn detect thread");
@@ -203,12 +271,9 @@ pub fn spawn(engine: Engine) {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_user_id, log_time};
+    use super::find_user_id;
     #[test]
     fn parses_log_names_and_user_ids() {
-        // 2026-10-09T08:03:41Z
-        assert_eq!(log_time("0.742.0.7421053_20261009T080341Z_Player_02B48_last.log"), Some(1791533021));
-        assert_eq!(log_time("garbage.log"), None);
         let line = "Report game_join_loadtime: placeid:13379208636, join_time:1.02, userid:11780444860, ";
         assert_eq!(find_user_id(line), Some(11780444860));
         assert_eq!(find_user_id("no id here"), None);

@@ -8,6 +8,12 @@ pub fn pct(s: &str) -> String {
 /// format the manager has always used. Same-server joins never use this builder — they are built by
 /// `uri_probe::build_rejoin` from a captured, verified template.
 /// `place` must be digits only (validated by caller).
+/// No game: opens the signed-in Roblox app on its home screen ("launchmode:app", the same mode
+/// roblox.com uses to open the app without joining anything).
+pub fn build_app(ticket: &str, ts_secs: u64) -> String {
+    format!("roblox-player:1+launchmode:app+gameinfo:{ticket}+launchtime:{}", ts_secs * 1000)
+}
+
 pub fn build(ticket: &str, ts_secs: u64, place: &str) -> String {
     let place: String = place.chars().filter(|c| c.is_ascii_digit()).collect();
     let url = format!("https://assetgame.roblox.com/game/placelauncher.ashx?request=RequestGame&placeId={place}");

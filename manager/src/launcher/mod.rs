@@ -1,4 +1,7 @@
+pub mod basic_settings;
 pub mod fastflags;
+pub mod games;
+pub mod search;
 pub mod spawn;
 pub mod uri;
 pub mod uri_probe;
@@ -50,6 +53,10 @@ pub struct Engine {
     pub updates: Arc<Mutex<crate::update::Updates>>,
     /// Roblox clients that aren't tracked for an account (watcher::detect).
     pub others: Arc<Mutex<Vec<crate::watcher::detect::OtherClient>>>,
+    /// Game-name search in the account page's Game box.
+    pub search: Arc<Mutex<search::SearchState>>,
+    /// universe id -> game name (None = being looked up).
+    pub game_names: Arc<Mutex<HashMap<u64, Option<String>>>>,
 }
 
 fn roblox_pids() -> Vec<u32> {
@@ -97,6 +104,8 @@ impl Engine {
             singleton: Default::default(),
             updates: Default::default(),
             others: Default::default(),
+            search: Default::default(),
+            game_names: Default::default(),
         }
     }
 
@@ -144,6 +153,9 @@ impl Engine {
             };
             let base_priority = presets.iter().find(|p| p.id == acc.preset_id).map_or(1, |p| p.priority);
             self.track_existing(id, pid, st, launch_ts, since, base_priority, None);
+            if let Some(e) = self.tr().get_mut(&id) {
+                e.title = acc.label.clone();
+            }
             self.log(id, "adopted", &format!("already running (PID {pid}) — picked up without restarting it"));
             n += 1;
         }
@@ -179,9 +191,84 @@ impl Engine {
             e.live_since_ts = since;
             e.base_priority = base_priority;
             e.log = log;
+            // Already running when we found it: assume it's in (or past) a game, so the
+            // "never got into a game" check doesn't fire on it.
+            e.joined = true;
+            e.pending_fail = None;
+            e.hung_since = None;
         }
         self.db.save_live(id, pid, st, launch_ts, since);
         let _ = self.db.set_status(id, "live");
+    }
+
+    /// A client of account `id` has ended: undo any of its profile's values it saved into Roblox's
+    /// shared settings file on the way out. Blocking (small file I/O); call off the UI thread.
+    pub fn after_client_exit(&self, id: i64) {
+        let Ok(acc) = self.db.get_account(id) else { return };
+        if let Ok(p) = self.db.get_preset(acc.preset_id) {
+            // Give the closing client a moment to finish writing first.
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            basic_settings::undo_after_exit(&p.gfx);
+        }
+    }
+
+    // ---------- convenience ----------
+    /// Bring this account's Roblox window to the front.
+    pub fn show_window(&self, id: i64) {
+        let Some(pid) = self.tr().get(&id).and_then(|t| t.pid) else { return };
+        std::thread::spawn(move || {
+            crate::watcher::winscan::focus(pid);
+        });
+    }
+
+    /// A few seconds after start-up (once already-running windows have been found), open every
+    /// account marked "Open when the manager starts" that isn't running yet.
+    pub fn auto_start(&self) {
+        let e = self.clone();
+        std::thread::Builder::new()
+            .name("auto-start".into())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(12));
+                let ids: Vec<i64> = e
+                    .db
+                    .list_accounts()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|a| a.auto_start && a.status != "needs_relogin")
+                    .map(|a| a.id)
+                    .filter(|id| !e.tr().contains_key(id))
+                    .collect();
+                if !ids.is_empty() {
+                    e.log(0, "auto_start", &format!("opening {} account(s) marked to start with the manager", ids.len()));
+                    e.launch_many(ids);
+                }
+            })
+            .ok();
+    }
+
+    // ---------- internet ----------
+    /// Can we reach Roblox at all? Any HTTP answer counts; only a network failure means offline.
+    pub async fn online(&self) -> bool {
+        self.http.get("https://www.roblox.com/").timeout(Duration::from_secs(6)).send().await.is_ok()
+    }
+
+    /// Blocks this launch (not the UI) until the internet is back, checking every 5 s. Returns false
+    /// if the user stopped the account meanwhile. Waiting never counts as a reconnect attempt.
+    async fn wait_for_internet(&self, id: i64, gen: u64) -> bool {
+        self.set_status(id, "offline");
+        self.log(id, "offline", "no internet connection — waiting for it to come back, then relaunching");
+        let started = Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if !self.current(id, gen) {
+                return false;
+            }
+            if self.online().await {
+                self.log(id, "online", &format!("internet is back after {} s — relaunching", started.elapsed().as_secs()));
+                self.set_status(id, "launching");
+                return true;
+            }
+        }
     }
 
     // ---------- several clients at once ----------
@@ -223,7 +310,8 @@ impl Engine {
                 let mut sys = System::new();
                 sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::new());
                 for p in sys.processes().values() {
-                    if p.name().to_string_lossy().eq_ignore_ascii_case("RobloxPlayerBeta.exe") {
+                    let n = p.name().to_string_lossy();
+                    if n.eq_ignore_ascii_case("RobloxPlayerBeta.exe") || n.eq_ignore_ascii_case("RobloxCrashHandler.exe") {
                         p.kill();
                     }
                 }
@@ -347,10 +435,43 @@ impl Engine {
     }
 
     pub async fn do_launch(&self, id: i64) {
-        let Ok(acc) = self.db.get_account(id) else { return };
-        if acc.place_id.is_empty() || !acc.place_id.bytes().all(|b| b.is_ascii_digit()) {
-            self.log(id, "blocked", "no game set — add a Place ID or game link first");
+        let Ok(mut acc) = self.db.get_account(id) else { return };
+        if !acc.place_id.bytes().all(|b| b.is_ascii_digit()) {
+            self.log(id, "blocked", "the game box doesn't hold a valid Place ID — fix it on the account page");
             return;
+        }
+        // No game set: a reconnect goes back to the game the window was last seen joining (read from
+        // its log); a fresh launch opens Roblox on its home screen.
+        if acc.place_id.is_empty() {
+            if let Some(p) = self.tr().get(&id).and_then(|t| t.last_place.clone()) {
+                acc.place_id = p;
+            }
+        }
+        let home = acc.place_id.is_empty();
+        // Already open outside the manager (identified by the detector)? Use that window rather than
+        // opening a second one, which would get one of them kicked.
+        if self.settings.read().unwrap().one_window_per_account && !self.tr().contains_key(&id) {
+            if let Some(uid) = self.db.user_id_of(id) {
+                let open = self.others.lock().unwrap().iter().find(|o| o.user_id == Some(uid)).map(|o| o.pid);
+                if let Some(pid) = open {
+                    let st = {
+                        let mut sys = System::new();
+                        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]), true, ProcessRefreshKind::new());
+                        sys.process(sysinfo::Pid::from_u32(pid)).map(|p| p.start_time())
+                    };
+                    if let Some(st) = st {
+                        let prio = self.db.get_preset(acc.preset_id).map(|p| p.priority).unwrap_or(1);
+                        self.track_existing(id, pid, st, st, st as i64, prio, None);
+                        if let Some(e) = self.tr().get_mut(&id) {
+                            e.title = acc.label.clone();
+                        }
+                        self.others.lock().unwrap().retain(|o| o.pid != pid);
+                        self.log(id, "adopted", &format!("already open (PID {pid}) — using that window instead of opening a second one"));
+                        let _ = self.wake.send(());
+                        return;
+                    }
+                }
+            }
         }
         let gen = self.gen.fetch_add(1, Ordering::SeqCst) + 1;
         {
@@ -365,6 +486,12 @@ impl Engine {
             e.user_killed = false;
             e.log = None;
             e.job_captured = false;
+            e.joined = false;
+            e.pending_fail = None;
+            e.hung_since = None;
+            e.home_launch = home;
+            e.denied_reported = false;
+            e.title = acc.label.clone();
         }
         self.set_status(id, "queued");
 
@@ -394,6 +521,10 @@ impl Engine {
             self.clear(id, "idle");
             return;
         }
+        // Frame-rate cap / quality / volume through Roblox's own settings; the user's values are put
+        // back when this is dropped (after the client is up, or on any early return).
+        let gfx = preset.gfx.clone();
+        let _restore = tokio::task::spawn_blocking(move || basic_settings::apply(&gfx)).await.ok();
 
         let cookie = match self.db.get_cookie(id) {
             Ok(c) => c,
@@ -417,6 +548,14 @@ impl Engine {
                     tokio::time::sleep(Duration::from_secs(2u64.pow(n))).await;
                 }
                 Err(er) => {
+                    // No internet (typical after Error 277): wait for it instead of burning a
+                    // reconnect attempt or giving up, then fetch again.
+                    if !self.online().await {
+                        if self.wait_for_internet(id, gen).await {
+                            continue;
+                        }
+                        return; // stopped while waiting
+                    }
                     let retry = self.settings.read().unwrap().retry_on_auth_fail;
                     self.log(id, "ticket_error", &format!("{er:?}"));
                     if retry {
@@ -439,13 +578,14 @@ impl Engine {
         let attempts = self.tr().get(&id).map(|e| e.attempts).unwrap_or(0);
         let schema = self.schema.read().unwrap().clone();
         let rejoin: Option<(UriSchema, String)> = match (schema, acc.last_job_id.clone()) {
-            (Some(sc), Some(j)) if s.same_server_rejoin && (1..=2).contains(&attempts) => Some((sc, j)),
+            (Some(sc), Some(j)) if !home && s.same_server_rejoin && (1..=2).contains(&attempts) => Some((sc, j)),
             _ => None,
         };
 
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let link: Zeroizing<String> = Zeroizing::new(match &rejoin {
             Some((sc, j)) => uri_probe::build_rejoin(sc, &ticket, &acc.place_id, j),
+            None if home => uri::build_app(&ticket, ts),
             None => uri::build(&ticket, ts, &acc.place_id),
         });
         drop(ticket);
@@ -460,11 +600,15 @@ impl Engine {
         self.log(
             id,
             "launch",
-            &format!(
-                "place {}{}",
-                acc.place_id,
-                if rejoin.is_some() { " — trying previous server (best-effort)" } else { "" }
-            ),
+            &if home {
+                "Roblox home screen (no game set)".to_string()
+            } else {
+                format!(
+                    "place {}{}",
+                    acc.place_id,
+                    if rejoin.is_some() { " — trying previous server (best-effort)" } else { "" }
+                )
+            },
         );
 
         // Bind PID: look for a new RobloxPlayerBeta.exe every 1.5 s, 30 s timeout. Keep looking even if

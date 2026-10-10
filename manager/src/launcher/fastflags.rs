@@ -17,14 +17,31 @@ pub fn current_version() -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
-/// None => remove the key (setting is "off"), so we never leave stale values behind.
+/// Only flags on Roblox's allow-list for local configuration. Everything else is "Denied local
+/// configuration" (it says so in its log) — including the frame-rate, texture-mip, post-effects and
+/// shadow flags older versions wrote, which are removed here. Frame-rate cap and graphics quality go
+/// through Roblox's own settings instead (launcher::basic_settings).
+/// None => remove the key, so we never leave stale values behind.
 fn to_flags(g: &Gfx) -> Vec<(&'static str, Option<Value>)> {
+    let tex = match g.skip_mips {
+        0 => None,
+        1 => Some(2),
+        2 => Some(1),
+        _ => Some(0),
+    };
     vec![
-        ("DFIntTaskSchedulerTargetFps", Some(Value::from(g.fps))),
-        ("FIntDebugTextureManagerSkipMips", Some(Value::from(g.skip_mips))),
-        ("FFlagDisablePostFx", g.post_fx_off.then(|| Value::Bool(true))),
-        ("FIntRenderShadowIntensity", g.shadows_off.then(|| Value::from(0))),
-        ("DFIntMaxFrameBufferSize", (g.fb_cap > 0).then(|| Value::from(g.fb_cap))),
+        ("DFFlagTextureQualityOverrideEnabled", tex.map(|_| Value::Bool(true))),
+        ("DFIntTextureQualityOverride", tex.map(Value::from)),
+        ("FIntDebugForceMSAASamples", g.msaa_off.then(|| Value::from(0))),
+        ("FIntFRMMaxGrassDistance", g.grass_off.then(|| Value::from(0))),
+        ("FIntFRMMinGrassDistance", g.grass_off.then(|| Value::from(0))),
+        ("DFIntDebugFRMQualityLevelOverride", (1..=10).contains(&g.graphics_quality).then(|| Value::from(g.graphics_quality))),
+        // Denied by Roblox; written by versions before 1.7.0. Always removed.
+        ("DFIntTaskSchedulerTargetFps", None),
+        ("FIntDebugTextureManagerSkipMips", None),
+        ("FFlagDisablePostFx", None),
+        ("FIntRenderShadowIntensity", None),
+        ("DFIntMaxFrameBufferSize", None),
     ]
 }
 

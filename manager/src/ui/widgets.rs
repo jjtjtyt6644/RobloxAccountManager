@@ -8,6 +8,8 @@ pub fn status_info(status: &str) -> (Color32, &'static str) {
         "queued" => (AMBER, "Queued"),
         "launching" => (AMBER, "Starting…"),
         "reconnecting" => (ORANGE, "Reconnecting…"),
+        "offline" => (AMBER, "Waiting for internet…"),
+        "stopping" => (GREY, "Stopping…"),
         "crashed" => (RED, "Stopped (crashed)"),
         "needs_relogin" => (PURPLE, "Sign-in expired"),
         _ => (GREY, "Not running"),
@@ -15,7 +17,7 @@ pub fn status_info(status: &str) -> (Color32, &'static str) {
 }
 
 pub fn is_running(status: &str) -> bool {
-    matches!(status, "live" | "queued" | "launching" | "reconnecting")
+    matches!(status, "live" | "queued" | "launching" | "reconnecting" | "offline" | "stopping")
 }
 
 /// (friendly label, colour, counts as a problem)
@@ -39,6 +41,12 @@ pub fn event_info(event: &str) -> (&'static str, Color32, bool) {
         "update" => ("Manager updated", GREEN, false),
         "adopted" => ("Picked up running game", GREEN, false),
         "detected" => ("Found running game", GREEN, false),
+        "offline" => ("Waiting for internet", AMBER, true),
+        "online" => ("Internet is back", GREEN, false),
+        "kill_failed" => ("Couldn't end Roblox", RED, true),
+        "duplicate" => ("Closed a second window", AMBER, false),
+        "denied" => ("Setting ignored by Roblox", AMBER, true),
+        "auto_start" => ("Opened on start", ACCENT, false),
         "roblox_update" => ("Roblox updated", GREEN, false),
         "update_failed" => ("Update failed", RED, true),
         _ => ("Event", GREY, false),
@@ -116,6 +124,19 @@ pub fn form_row<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::U
     .inner
 }
 
+/// "45m", "1h 05m", "2d 3h" since a unix time.
+pub fn uptime(since: i64) -> String {
+    let s = (crate::storage::db::now() - since).max(0);
+    let (d, h, m) = (s / 86400, s % 86400 / 3600, s % 3600 / 60);
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m:02}m")
+    } else {
+        format!("{m}m")
+    }
+}
+
 pub fn local_time(ts: i64, with_date: bool) -> String {
     use chrono::TimeZone;
     match chrono::Local.timestamp_opt(ts, 0).single() {
@@ -166,6 +187,23 @@ pub fn choice_tiles(ui: &mut egui::Ui, selected: &mut usize, options: &[(&str, &
         }
     });
     changed
+}
+
+/// A warning under a setting: amber = "you may not want this", red = "this will likely cause problems".
+pub fn warn(ui: &mut egui::Ui, severe: bool, text: &str) {
+    let c = if severe { RED } else { AMBER };
+    egui::Frame::none()
+        .fill(c.gamma_multiply(0.10))
+        .stroke(Stroke::new(1.0, c.gamma_multiply(0.45)))
+        .rounding(Rounding::same(8.0))
+        .inner_margin(Margin::symmetric(12.0, 8.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("⚠").color(c).strong());
+                ui.label(RichText::new(text).color(c).size(13.0));
+            });
+        });
 }
 
 /// Explanation box under a choice: what it does, and what it costs.

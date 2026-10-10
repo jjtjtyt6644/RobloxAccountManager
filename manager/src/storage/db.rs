@@ -21,20 +21,56 @@ pub struct Account {
     pub group_tag: String,
     pub last_job_id: Option<String>,
     pub status: String,
+    /// Game name, when the game was picked from search ("" otherwise).
+    pub place_name: String,
+    /// Open this account automatically when the manager starts.
+    pub auto_start: bool,
 }
 
+/// A performance profile's settings. `#[serde(default)]` so profiles saved by older versions load.
 #[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(default)]
 pub struct Gfx {
+    /// Frame-rate cap via Roblox's own setting: 0 = don't change, 240+ = uncapped.
     pub fps: u32,
+    /// Texture quality: 0 = full (not changed), 1 = high, 2 = medium, 3+ = lowest.
     pub skip_mips: u32,
+    /// Graphics quality 1–10 via Roblox's own setting; 0 = don't change.
+    pub graphics_quality: u32,
+    /// No anti-aliasing (allow-listed flag).
+    pub msaa_off: bool,
+    /// No grass (allow-listed flags).
+    pub grass_off: bool,
+    /// Volume to 0 for windows using this profile.
+    pub mute: bool,
+    // Kept so old profiles still load; Roblox denies these flags now, so they're not written.
     pub post_fx_off: bool,
     pub shadows_off: bool,
-    pub fb_cap: u32, // 0 = leave unset
+    pub fb_cap: u32,
 }
 impl Default for Gfx {
     fn default() -> Self {
-        Gfx { fps: 60, skip_mips: 0, post_fx_off: false, shadows_off: false, fb_cap: 0 }
+        Gfx {
+            fps: 0,
+            skip_mips: 0,
+            graphics_quality: 0,
+            msaa_off: false,
+            grass_off: false,
+            mute: false,
+            post_fx_off: false,
+            shadows_off: false,
+            fb_cap: 0,
+        }
     }
+}
+
+/// Light profile for alts: 30 fps, low quality, medium textures, no anti-aliasing or grass, muted.
+fn alt_low() -> Gfx {
+    Gfx { fps: 30, skip_mips: 2, graphics_quality: 3, msaa_off: true, grass_off: true, mute: true, ..Gfx::default() }
+}
+/// Lightest profile for AFK alts.
+fn alt_minimal() -> Gfx {
+    Gfx { fps: 15, skip_mips: 3, graphics_quality: 1, msaa_off: true, grass_off: true, mute: true, ..Gfx::default() }
 }
 
 #[derive(Clone, Default)]
@@ -78,7 +114,16 @@ pub struct Settings {
     pub auto_reconnect: bool,
     pub max_attempts: u32,
     pub delay_secs: u64,
-    pub log_tail: bool,
+    /// Read each client's Roblox log to notice disconnects, kicks, server shutdowns and the like
+    /// (they're drawn inside the game, not as windows), plus frozen windows and failed joins.
+    pub detect_disconnects: bool,
+    /// Also count "left the game, back on the Roblox home screen" as something to recover from.
+    pub reopen_if_left: bool,
+    /// Title each Roblox window after its account ("Roblox — Main").
+    pub title_windows: bool,
+    /// One Roblox window per account: a second window of an account that's already open is closed
+    /// straight away and the first one keeps playing.
+    pub one_window_per_account: bool,
     pub retry_on_auth_fail: bool, // applies to non-401 ticket failures; 401 always => needs_relogin
     pub trim_mode: TrimMode,
     /// Per background client, in MB.
@@ -108,7 +153,10 @@ impl Default for Settings {
             auto_reconnect: true,
             max_attempts: 3,
             delay_secs: 5,
-            log_tail: false,
+            detect_disconnects: true,
+            reopen_if_left: true,
+            title_windows: true,
+            one_window_per_account: true,
             retry_on_auth_fail: false,
             trim_mode: TrimMode::Off,
             trim_target_mb: 100,
@@ -152,7 +200,7 @@ CREATE TABLE IF NOT EXISTS launch_events(
   id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, ts INTEGER NOT NULL,
   event TEXT NOT NULL, detail TEXT NOT NULL);
 ";
-const COLS: &str = "id,label,username,place_id,preset_id,group_tag,last_job_id,status";
+const COLS: &str = "id,label,username,place_id,preset_id,group_tag,last_job_id,status,COALESCE(place_name,''),auto_start";
 
 fn row_acc(r: &Row) -> rusqlite::Result<Account> {
     Ok(Account {
@@ -164,6 +212,8 @@ fn row_acc(r: &Row) -> rusqlite::Result<Account> {
         group_tag: r.get(5)?,
         last_job_id: r.get(6)?,
         status: r.get(7)?,
+        place_name: r.get(8)?,
+        auto_start: r.get::<_, i64>(9)? != 0,
     })
 }
 
@@ -189,12 +239,22 @@ impl Db {
         if !has_uid {
             c.execute_batch("ALTER TABLE accounts ADD COLUMN user_id INTEGER;")?;
         }
+        // Added in 1.5.0: the game's name when it was picked from search.
+        let has_pname: bool = c.prepare("SELECT 1 FROM pragma_table_info('accounts') WHERE name='place_name'")?.exists([])?;
+        if !has_pname {
+            c.execute_batch("ALTER TABLE accounts ADD COLUMN place_name TEXT;")?;
+        }
+        // Added in 1.6.0: open this account when the manager starts.
+        let has_auto: bool = c.prepare("SELECT 1 FROM pragma_table_info('accounts') WHERE name='auto_start'")?.exists([])?;
+        if !has_auto {
+            c.execute_batch("ALTER TABLE accounts ADD COLUMN auto_start INTEGER NOT NULL DEFAULT 0;")?;
+        }
         let n: i64 = c.query_row("SELECT COUNT(*) FROM presets", [], |r| r.get(0))?;
         if n == 0 {
             let seeds = [
-                ("Main", Gfx { fps: 60, ..Gfx::default() }, 0),
-                ("Alt-Low", Gfx { fps: 15, skip_mips: 2, post_fx_off: true, shadows_off: true, fb_cap: 0 }, 1),
-                ("Alt-Minimal", Gfx { fps: 10, skip_mips: 4, post_fx_off: true, shadows_off: true, fb_cap: 0 }, 1),
+                ("Main", Gfx::default(), 0),
+                ("Alt-Low", alt_low(), 1),
+                ("Alt-Minimal", alt_minimal(), 1),
             ];
             for (name, g, pr) in seeds {
                 c.execute(
@@ -202,6 +262,33 @@ impl Db {
                     params![name, serde_json::to_string(&g)?, pr],
                 )?;
             }
+        }
+        // 1.7.0: the seeded profiles used flags Roblox now denies. If they're still exactly as seeded,
+        // move them to settings that work (user-edited profiles are left alone).
+        for (name, old, new) in [
+            ("Main", r#""fps":60,"skip_mips":0,"post_fx_off":false,"shadows_off":false,"fb_cap":0"#, Gfx::default()),
+            ("Alt-Low", r#""fps":15,"skip_mips":2,"post_fx_off":true,"shadows_off":true,"fb_cap":0"#, alt_low()),
+            ("Alt-Minimal", r#""fps":10,"skip_mips":4,"post_fx_off":true,"shadows_off":true,"fb_cap":0"#, alt_minimal()),
+        ] {
+            let json = format!("{{{old}}}");
+            c.execute(
+                "UPDATE presets SET flags_json=?1 WHERE name=?2 AND flags_json=?3",
+                params![serde_json::to_string(&new)?, name, json],
+            )?;
+        }
+        // Any other profile saved before 1.7.0 (no "graphics_quality" yet): its shadows/effects
+        // switches no longer work, so carry the intent over to the quality setting Roblox accepts.
+        let old: Vec<(i64, String)> = c
+            .prepare("SELECT id,flags_json FROM presets WHERE flags_json NOT LIKE '%graphics_quality%'")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        for (id, json) in old {
+            let mut g: Gfx = serde_json::from_str(&json).unwrap_or_default();
+            if g.shadows_off || g.post_fx_off {
+                g.graphics_quality = if g.shadows_off && g.post_fx_off { 1 } else { 3 };
+                g.msaa_off = true;
+            }
+            c.execute("UPDATE presets SET flags_json=?1 WHERE id=?2", params![serde_json::to_string(&g)?, id])?;
         }
         Ok(Db(Arc::new(Mutex::new(c))))
     }
@@ -249,13 +336,20 @@ impl Db {
         Ok(Zeroizing::new(String::from_utf8(plain.to_vec())?))
     }
 
+    /// Sets the game; `name` is its display name when known (picked from search), else "".
     pub fn set_place(&self, id: i64, v: &str) -> Res<()> {
-        self.c().execute("UPDATE accounts SET place_id=?1 WHERE id=?2", params![v, id])?;
+        self.set_place_named(id, v, "")
+    }
+    pub fn set_place_named(&self, id: i64, v: &str, name: &str) -> Res<()> {
+        self.c().execute("UPDATE accounts SET place_id=?1, place_name=?2 WHERE id=?3", params![v, name, id])?;
         Ok(())
     }
     pub fn set_label(&self, id: i64, v: &str) -> Res<()> {
         self.c().execute("UPDATE accounts SET label=?1 WHERE id=?2", params![v, id])?;
         Ok(())
+    }
+    pub fn set_auto_start(&self, id: i64, on: bool) {
+        let _ = self.c().execute("UPDATE accounts SET auto_start=?1 WHERE id=?2", params![on as i64, id]);
     }
     pub fn set_group(&self, id: i64, v: &str) -> Res<()> {
         self.c().execute("UPDATE accounts SET group_tag=?1 WHERE id=?2", params![v, id])?;
@@ -288,6 +382,14 @@ impl Db {
         let c = self.c();
         let Ok(mut st) = c.prepare("SELECT id,username FROM accounts WHERE user_id IS NULL OR user_id=0") else { return vec![] };
         st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map(|it| it.flatten().collect()).unwrap_or_default()
+    }
+    pub fn user_id_of(&self, id: i64) -> Option<u64> {
+        self.c()
+            .query_row("SELECT user_id FROM accounts WHERE id=?1", [id], |r| r.get::<_, Option<i64>>(0))
+            .ok()
+            .flatten()
+            .filter(|v| *v > 0)
+            .map(|v| v as u64)
     }
     pub fn account_by_user_id(&self, uid: u64) -> Option<i64> {
         self.c().query_row("SELECT id FROM accounts WHERE user_id=?1", [uid as i64], |r| r.get(0)).ok()

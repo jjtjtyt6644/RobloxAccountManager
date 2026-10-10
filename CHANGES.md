@@ -1,3 +1,68 @@
+# 1.7.0 — one window per account, profiles that actually work
+
+## One window per account
+- If a second Roblox window opens for an account that's already playing (from the website, a shortcut, anywhere), it's closed straight away and the first one keeps going. New windows are checked several times a second until they're identified, so the duplicate is usually gone before Roblox can kick the original (Error 273). If Roblox still manages to, the original is reconnected automatically.
+- Pressing Play for an account that's already open outside the manager now uses that window instead of opening a second one.
+- On by default: Settings > Games > "Only one window per account".
+
+## Performance profiles now take effect
+- Roblox has been rejecting the settings older versions wrote ("Denied local configuration" in its log: frame-rate cap, textures, post-effects, shadows). Profiles now use what Roblox accepts: its own frame-rate cap, graphics quality (1–10) and volume settings, plus allow-listed texture-quality, anti-aliasing and grass settings. Your own Roblox settings are put back after each launch, and again if a closing window saved its profile's values over them.
+- New profile options: graphics quality, turn off anti-aliasing, turn off grass, mute sound. Frame-rate cap can now be "Don't change" or "Uncapped".
+- Alt-Low is now 30 fps, quality 3, medium textures, no anti-aliasing or grass, muted. Alt-Minimal (new installs) is 15 fps, quality 1, lowest textures, muted. Profiles you've edited keep your choices, and their shadows/effects-off settings carry over as low graphics quality.
+- If Roblox ever ignores a profile setting again, Activity says which one.
+
+## Lighter on CPU
+- The window check no longer snapshots every thread on the PC every second; it lists windows directly, and the check runs every 2 seconds. Memory figures refresh every 5 seconds. Disconnects are still noticed within a second.
+
+# 1.6.0 — see what's playing, cleaner stops
+
+## Stop really stops
+- Stop now ends Roblox completely, including the RobloxCrashHandler.exe each window starts, and checks that everything is gone. If a window refuses to close it's force-ended, and if Windows won't allow that, Activity says so. Closing the manager with "close all Roblox windows" set does the same for every window at once.
+- The account shows "Stopping…" while it closes.
+
+## See what each account is doing
+- Each running account shows the game it's in and for how long, e.g. "Playing Adopt Me! · 1h 05m", in the list and at the top of its page. The name comes from Roblox's log and one lookup per game, with update tags like "[6H⏳]" removed.
+
+## More
+- Show window: brings an account's Roblox window to the front, restoring it if minimized.
+- Window titles: each Roblox window is named after its account ("Roblox — Main"), so they're easy to tell apart on the taskbar and in Alt+Tab. You can turn this off in Settings > Games.
+- Open on start: tick "Open this account when the manager starts" on any account to have it launched automatically. Accounts that are already running are left alone.
+
+# 1.5.0 — search games by name, play without a game
+
+## New
+- Find a game by name: type it in the account's Game box (e.g. "Adopt Me") and pick it from the list of matching games with their player counts. The search only runs once you stop typing, and no images are downloaded, so it doesn't add to memory, CPU or GPU use. Links and Place IDs still work, and the game's name is shown once it's set.
+- Play without a game: accounts with no game set can be launched. Roblox opens on its home screen, where you can pick a game. Pressing Play (or Launch for a selection) first shows a "No game set" warning with Play anyway / Set a game / Cancel.
+- If a window opened that way disconnects later, the manager reopens the last game it saw that window join. Being on the home screen isn't treated as a problem for these windows.
+
+## Warnings for risky saver settings
+- Memory saver: a red warning for Max with a limit under 200 MB (Roblox can freeze, crash or disconnect), and an amber one for any target under 100 MB.
+- CPU saver: Strong warns on PCs with 4 CPU threads or fewer, and when more than 4 windows would share the same 2 cores.
+- "Every Roblox window, including the one I'm playing" now spells out exactly what will happen to the game you're playing, in red when it's Max or Strong.
+
+# 1.4.1 — survives internet outages, readable on every PC
+
+## Fixed
+- Text was hard to read (dark text on dark backgrounds) and buttons looked different on PCs where Windows is set to light mode, which is common on Windows 10. The app now always uses its dark theme, whatever the Windows setting.
+- After Error 277 caused by the internet going down, the relaunch failed straight away and the account was marked as stopped. Now the account shows "Waiting for internet…", checks every 5 seconds, and relaunches as soon as the connection is back, however long it takes. Waiting doesn't use up a reconnect attempt, and Stop still works while it waits.
+
+# 1.4.0 — reconnects after disconnects and kicks
+
+## Fixed
+- "Disconnected from the experience" didn't trigger a reconnect. The manager was looking for log phrases Roblox no longer writes, and log watching was off by default. It now reads the lines Roblox actually writes ("Client has been disconnected with reason: ...", "Lost connection with reason: ...") and is on by default.
+
+## Now detected and recovered
+- Lost connection (277), kicked (267), server shut down, same account joined elsewhere (273), idle kicks and any other "disconnected with reason" message. Roblox's own reason is shown in Activity.
+- A window that stops responding for 60 seconds.
+- A freshly launched window that hasn't got into the game after 3 minutes (stuck on an error or a full server).
+- Optional, on by default: a window that leaves the game and ends up on the Roblox home screen.
+- Crashes and error pop-up windows, as before.
+
+## Smarter
+- Waits 10 seconds after a disconnect before acting, and cancels if the window rejoins by itself (a teleport, or Roblox's own Reconnect button).
+- Each window's log is matched by its exact start time, so several windows never mix up each other's logs.
+- Only complete log lines are read, so a line Roblox is halfway through writing is never misread.
+
 # 1.3.0 — finds every Roblox window, clearer settings
 
 ## New
